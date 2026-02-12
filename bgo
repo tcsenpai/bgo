@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""
+bgo - A lightweight background process manager
+Like pm2, but simpler, lighter, and without the forking headaches.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Config
+BGO_DIR = Path.home() / ".bgo"
+PROCS_DIR = BGO_DIR / "procs"
+LOGS_DIR = BGO_DIR / "logs"
+
+# ANSI colors
+COLORS = {
+    "green": "\033[32m",
+    "red": "\033[31m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "gray": "\033[90m",
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+}
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def color(name: str, text: str) -> str:
+    """Wrap text in color codes, only if stdout is a TTY."""
+    if not sys.stdout.isatty():
+        return str(text)
+    return f"{COLORS.get(name, '')}{text}{COLORS['reset']}"
+
+
+def strip_ansi(s: str) -> str:
+    """Remove ANSI escape codes from a string."""
+    return ANSI_RE.sub("", s)
+
+
+def truncate(s: str, width: int) -> str:
+    """Truncate string to fit in width, accounting for ANSI codes."""
+    plain = strip_ansi(s)
+    if len(plain) > width:
+        return s[: width - 3] + "..."
+    return s
+
+
+def init_dirs():
+    """Initialize required directories."""
+    PROCS_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# --- State management (one file per process) ---
+
+
+def proc_file(name: str) -> Path:
+    return PROCS_DIR / f"{name}.json"
+
+
+def log_path(name: str, stream: str = "out") -> Path:
+    return LOGS_DIR / f"{name}.{stream}.log"
+
+
+def load_proc(name: str) -> dict | None:
+    pf = proc_file(name)
+    if not pf.exists():
+        return None
+    try:
+        return json.loads(pf.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_proc(name: str, info: dict):
+    proc_file(name).write_text(json.dumps(info, indent=2))
+
+
+def delete_proc(name: str):
+    """Remove proc file and logs."""
+    proc_file(name).unlink(missing_ok=True)
+    for stream in ("out", "err"):
+        log_path(name, stream).unlink(missing_ok=True)
+
+
+def load_all_procs() -> dict[str, dict]:
+    """Load all process states."""
+    procs = {}
+    for pf in sorted(PROCS_DIR.glob("*.json")):
+        try:
+            info = json.loads(pf.read_text())
+            procs[info.get("name", pf.stem)] = info
+        except (json.JSONDecodeError, OSError):
+            continue
+    return procs
+
+
+# --- Utilities ---
+
+
+def is_running(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def get_process_info(pid: int) -> dict:
+    """Get CPU/MEM/uptime via ps."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "%cpu,%mem,etime", "--no-headers"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            if len(parts) >= 3:
+                return {"cpu": parts[0], "mem": parts[1], "time": parts[2]}
+    except Exception:
+        pass
+    return {"cpu": "-", "mem": "-", "time": "-"}
+
+
+def derive_name(cmd: list[str]) -> str:
+    """Derive a process name from the command."""
+    base = os.path.basename(cmd[0])
+    for ext in (".py", ".sh", ".js", ".ts", ".rb", ".pl", ".exe"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    return base
+
+
+def resolve_command(cmd: list[str]) -> list[str]:
+    """Resolve command to full path if possible."""
+    binary = shutil.which(cmd[0])
+    if binary:
+        cmd = cmd[:]
+        cmd[0] = binary
+    return cmd
+
+
+def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
+    """Kill a process (and its entire process group). Returns True if dead."""
+    sig = signal.SIGKILL if force else signal.SIGTERM
+
+    try:
+        if pgid:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        print(f"{color('red', '❌')} Permission denied killing PID {pid}")
+        return False
+
+    # Wait for termination
+    for _ in range(50):  # 5 seconds
+        if not is_running(pid):
+            return True
+        time.sleep(0.1)
+
+    # Escalate to SIGKILL if SIGTERM didn't work
+    if not force and is_running(pid):
+        try:
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            time.sleep(0.3)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    return not is_running(pid)
+
+
+# --- Commands ---
+
+
+def cmd_start(args):
+    """Start a process in the background."""
+    init_dirs()
+
+    name = args.name
+    command = getattr(args, "cmd", None) or getattr(args, "command", [])
+
+    # Filter out leading '--' if present
+    if command and command[0] == "--":
+        command = command[1:]
+
+    if not command:
+        print(f"{color('red', '❌')} No command specified")
+        print(f"   Usage: bgo start {name} -- <command> [args...]")
+        return 1
+
+    # Check if already running
+    existing = load_proc(name)
+    if existing and is_running(existing.get("pid")):
+        print(
+            f"{color('red', '❌')} Process '{name}' is already running (PID: {existing['pid']})"
+        )
+        print(f"   Use 'bgo stop {name}' first or choose a different name.")
+        return 1
+
+    command = resolve_command(command)
+
+    # Prepare log files
+    stdout_log = log_path(name, "out")
+    stderr_log = log_path(name, "err")
+
+    with open(stdout_log, "a") as out_f, open(stderr_log, "a") as err_f:
+        # Write start marker
+        timestamp = datetime.now().isoformat()
+        marker = f"\n=== [{timestamp}] Starting: {' '.join(command)} ===\n"
+        out_f.write(marker)
+        err_f.write(marker)
+        out_f.flush()
+        err_f.flush()
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=out_f,
+                stderr=err_f,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=args.cwd or os.getcwd(),
+            )
+        except FileNotFoundError:
+            print(f"{color('red', '❌')} Command not found: {command[0]}")
+            return 1
+        except PermissionError:
+            print(f"{color('red', '❌')} Permission denied: {command[0]}")
+            return 1
+        except Exception as e:
+            print(f"{color('red', '❌')} Failed to start: {e}")
+            return 1
+
+    # Brief check for immediate crash
+    time.sleep(0.1)
+    if not is_running(process.pid):
+        print(
+            f"{color('red', '❌')} Process '{name}' failed to start (exited immediately)"
+        )
+        print(f"   Check logs: bgo logs {name}")
+        return 1
+
+    # Get pgid for process group killing
+    try:
+        pgid = os.getpgid(process.pid)
+    except OSError:
+        pgid = None
+
+    info = {
+        "name": name,
+        "pid": process.pid,
+        "pgid": pgid,
+        "command": command,
+        "cwd": args.cwd or os.getcwd(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running",
+    }
+    save_proc(name, info)
+
+    print(f"{color('green', '✅')} Started '{name}' (PID: {process.pid})")
+    print(f"   Logs: bgo logs {name}")
+    return 0
+
+
+def cmd_stop(args):
+    """Stop a running process."""
+    name = args.name
+    info = load_proc(name)
+
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+
+    pid = info.get("pid")
+
+    if not is_running(pid):
+        print(f"{color('yellow', '⚠️')}  Process '{name}' is not running")
+        info["status"] = "stopped"
+        save_proc(name, info)
+        return 0
+
+    force = getattr(args, "force", False)
+    pgid = info.get("pgid")
+
+    killed = kill_process(pid, pgid, force=force)
+
+    if killed:
+        label = "💀 Killed" if force else "🛑 Stopped"
+        print(f"{label} '{name}' (PID: {pid})")
+        info["status"] = "stopped"
+        info["stopped_at"] = datetime.now(timezone.utc).isoformat()
+        save_proc(name, info)
+    else:
+        print(
+            f"{color('red', '❌')} Failed to stop '{name}' (PID: {pid}). Try --force"
+        )
+        return 1
+
+    return 0
+
+
+def cmd_restart(args):
+    """Restart a process."""
+    name = args.name
+    info = load_proc(name)
+
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+
+    # Stop if running
+    pid = info.get("pid")
+    if is_running(pid):
+        print(f"🛑 Stopping '{name}'...")
+        kill_process(pid, info.get("pgid"))
+
+    # Restart with same config
+    restart_args = argparse.Namespace(
+        name=name,
+        command=info["command"],
+        cwd=info.get("cwd"),
+    )
+    return cmd_start(restart_args)
+
+
+def cmd_status(args):
+    """Show status of all processes."""
+    procs = load_all_procs()
+
+    if not procs:
+        print("No processes registered.")
+        print("Usage: bgo start <n> -- <command> [args...]")
+        print("       bgo <command> [args...]")
+        return 0
+
+    if getattr(args, "watch", False):
+        os.system("clear" if os.name != "nt" else "cls")
+
+    # If a specific name is given, show detail view
+    if getattr(args, "name", None):
+        name = args.name
+        info = load_proc(name)
+        if not info:
+            print(f"{color('red', '❌')} No process named '{name}' found")
+            return 1
+        _print_proc_detail(info)
+        return 0
+
+    # Table view
+    term_width = shutil.get_terminal_size().columns
+    name_width = max(12, max(len(n) for n in procs.keys()) + 2)
+    cmd_width = max(20, term_width - name_width - 55)
+
+    header = (
+        f"{color('bold', 'NAME'):<{name_width}} "
+        f"{color('bold', 'STATUS'):<10} "
+        f"{color('bold', 'PID'):<8} "
+        f"{color('bold', 'CPU'):<7} "
+        f"{color('bold', 'MEM'):<7} "
+        f"{color('bold', 'UPTIME'):<12} "
+        f"{color('bold', 'COMMAND')}"
+    )
+    print(header)
+    print(color("gray", "─" * term_width))
+
+    running_count = 0
+    stopped_count = 0
+
+    for name, info in sorted(procs.items()):
+        pid = info.get("pid")
+        cmd_str = " ".join(info.get("command", []))
+        cmd_str = truncate(cmd_str, cmd_width)
+
+        if is_running(pid):
+            running_count += 1
+            proc_info = get_process_info(pid)
+            status_str = color("green", "online")
+            print(
+                f"{name:<{name_width}} "
+                f"{status_str:<10} "
+                f"{color('gray', str(pid)):<8} "
+                f"{proc_info['cpu']:<7} "
+                f"{proc_info['mem']:<7} "
+                f"{proc_info['time']:<12} "
+                f"{cmd_str}"
+            )
+        else:
+            stopped_count += 1
+            status_str = color("red", "stopped")
+            print(
+                f"{name:<{name_width}} "
+                f"{status_str:<10} "
+                f"{'-':<8} "
+                f"{'-':<7} "
+                f"{'-':<7} "
+                f"{'-':<12} "
+                f"{color('gray', cmd_str)}"
+            )
+            # Update status in state
+            info["status"] = "stopped"
+            save_proc(name, info)
+
+    print(color("gray", "─" * term_width))
+    print(
+        f"Total: {len(procs)} | {color('green', 'online')}: {running_count} | {color('red', 'stopped')}: {stopped_count}"
+    )
+
+    return 0
+
+
+def _print_proc_detail(info: dict):
+    """Print detailed info for a single process."""
+    pid = info["pid"]
+    running = is_running(pid)
+    status_str = color("green", "online") if running else color("red", "stopped")
+
+    print(f"{color('bold', 'Process:')} {info['name']}")
+    print(f"  Status:  {status_str}")
+    print(f"  PID:     {pid}")
+    print(f"  PGID:    {info.get('pgid', 'N/A')}")
+    print(f"  Command: {' '.join(info['command'])}")
+    print(f"  CWD:     {info.get('cwd', 'N/A')}")
+    print(f"  Started: {info.get('started_at', 'N/A')}")
+
+    if running:
+        proc_info = get_process_info(pid)
+        print(f"  CPU:     {proc_info['cpu']}%")
+        print(f"  MEM:     {proc_info['mem']}%")
+        print(f"  Uptime:  {proc_info['time']}")
+
+    for stream, label in [("out", "stdout"), ("err", "stderr")]:
+        lf = log_path(info["name"], stream)
+        if lf.exists():
+            size = lf.stat().st_size
+            print(f"  {label}:  {_human_size(size)} ({lf})")
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def cmd_logs(args):
+    """Show logs for a process."""
+    name = args.name
+    info = load_proc(name)
+
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+
+    # Determine which log to show
+    if getattr(args, "stderr", False):
+        stream = "err"
+    elif getattr(args, "stdout", False):
+        stream = "out"
+    else:
+        stream = "out"
+
+    lf = log_path(name, stream)
+
+    if not lf.exists() or lf.stat().st_size == 0:
+        label = "stderr" if stream == "err" else "stdout"
+        print(f"No {label} logs found for '{name}'")
+        if not getattr(args, "follow", False):
+            return 0
+
+    lines_to_show = getattr(args, "lines", 50)
+    follow = getattr(args, "follow", False)
+
+    if follow:
+        # Follow mode: use tail -f for reliability
+        tail_args = ["tail", "-f", "-n", str(lines_to_show)]
+
+        # Show both streams if not explicitly filtered
+        files = []
+        if not getattr(args, "stderr", False) and not getattr(args, "stdout", False):
+            err_log = log_path(name, "err")
+            files.append(str(lf))
+            if err_log.exists() and err_log.stat().st_size > 0:
+                files.append(str(err_log))
+        else:
+            files.append(str(lf))
+
+        print(color("gray", "─" * 50))
+        print(color("yellow", f"Following logs for '{name}' (Ctrl+C to exit)"))
+        print(color("gray", "─" * 50))
+
+        try:
+            subprocess.run(tail_args + files)
+        except KeyboardInterrupt:
+            print(color("gray", "\n[stopped following]"))
+    else:
+        # Static view
+        try:
+            with open(lf) as f:
+                lines = f.readlines()
+
+            if lines_to_show > 0 and len(lines) > lines_to_show:
+                lines = lines[-lines_to_show:]
+                print(f"... (showing last {lines_to_show} lines)\n")
+
+            for line in lines:
+                print(line, end="")
+
+            # Also show stderr if not filtered and has content
+            if stream == "out" and not getattr(args, "stdout", False):
+                err_log = log_path(name, "err")
+                if err_log.exists() and err_log.stat().st_size > 0:
+                    with open(err_log) as f:
+                        err_lines = f.readlines()
+                    if err_lines:
+                        if lines_to_show > 0 and len(err_lines) > lines_to_show:
+                            err_lines = err_lines[-lines_to_show:]
+                        print(f"\n{color('gray', '─── stderr ───')}")
+                        for line in err_lines:
+                            print(line, end="")
+
+        except FileNotFoundError:
+            print(f"Log file not found: {lf}")
+            return 1
+
+    return 0
+
+
+def cmd_logs_follow(args):
+    """Follow logs for a process (shorthand for logs -f)."""
+    args.follow = True
+    if not hasattr(args, "lines") or args.lines is None:
+        args.lines = 10
+    return cmd_logs(args)
+
+
+def cmd_clean(args):
+    """Remove stopped processes from state."""
+    procs = load_all_procs()
+    cleaned = []
+
+    for name, info in procs.items():
+        pid = info.get("pid")
+        if not is_running(pid):
+            cleaned.append(name)
+            delete_proc(name)
+
+    if cleaned:
+        print(
+            f"🧹 Cleaned up {len(cleaned)} stopped process(es): {', '.join(cleaned)}"
+        )
+    else:
+        print("Nothing to clean up.")
+
+    return 0
+
+
+def cmd_delete(args):
+    """Delete a process from state (stop if running first)."""
+    name = args.name
+    info = load_proc(name)
+
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+
+    # Stop if running
+    pid = info.get("pid")
+    if is_running(pid):
+        if not getattr(args, "yes", False):
+            confirm = input(f"Process '{name}' is running. Stop and delete? [y/N] ")
+            if confirm.lower() != "y":
+                print("Cancelled.")
+                return 0
+        kill_process(pid, info.get("pgid"))
+
+    delete_proc(name)
+    print(f"🗑️  Deleted '{name}'")
+    return 0
+
+
+# --- CLI ---
+
+
+def main():
+    init_dirs()
+
+    known_commands = {
+        "start", "stop", "restart", "status", "logs", "clean",
+        "delete", "ls", "list", "follow", "tail", "-h", "--help",
+    }
+
+    # Direct mode: bgo <n> -- <cmd>   OR   bgo <cmd> [args...]
+    if len(sys.argv) > 1 and sys.argv[1] not in known_commands:
+        remaining = sys.argv[1:]
+
+        # Check if there's a '--' separator → explicit name mode
+        if "--" in remaining:
+            sep_idx = remaining.index("--")
+            name = remaining[0] if sep_idx > 0 else None
+            command = remaining[sep_idx + 1 :]
+
+            if not name or not command:
+                print("Usage: bgo <n> -- <command> [args...]")
+                return 1
+
+            args = argparse.Namespace(name=name, command=command, cwd=None)
+            return cmd_start(args)
+        else:
+            # No '--' → auto-derive name from binary
+            command = remaining
+            name = derive_name(command)
+            args = argparse.Namespace(name=name, command=command, cwd=None)
+            return cmd_start(args)
+
+    parser = argparse.ArgumentParser(
+        prog="bgo",
+        description="A lightweight background process manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  bgo python3 server.py                    # Start (auto-name: 'server')
+  bgo start myapp -- python3 server.py     # Start with explicit name
+  bgo myapp -- ./api-server --port 8080    # Shorthand with name
+  bgo status                               # Show all processes
+  bgo status myapp                         # Detailed view of one process
+  bgo logs myapp                           # View logs
+  bgo logs myapp -f                        # Follow logs (tail -f)
+  bgo follow myapp                         # Shorthand for logs -f
+  bgo stop myapp                           # Stop (SIGTERM → SIGKILL)
+  bgo stop myapp --force                   # Force kill (SIGKILL)
+  bgo restart myapp                        # Restart a process
+  bgo delete myapp                         # Remove from list + logs
+  bgo clean                                # Remove all stopped entries
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # start
+    start_parser = subparsers.add_parser("start", help="Start a process")
+    start_parser.add_argument("name", help="Name for this process")
+    start_parser.add_argument(
+        "cmd", nargs=argparse.REMAINDER, help="Command to run (use -- before command)"
+    )
+    start_parser.add_argument("--cwd", help="Working directory for the process")
+
+    # stop
+    stop_parser = subparsers.add_parser("stop", help="Stop a process")
+    stop_parser.add_argument("name", help="Name of the process")
+    stop_parser.add_argument(
+        "-f", "--force", action="store_true", help="Force kill (SIGKILL)"
+    )
+
+    # restart
+    restart_parser = subparsers.add_parser("restart", help="Restart a process")
+    restart_parser.add_argument("name", help="Name of the process")
+
+    # status
+    status_parser = subparsers.add_parser(
+        "status", aliases=["ls", "list"], help="Show process status"
+    )
+    status_parser.add_argument(
+        "name", nargs="?", default=None, help="Show details for specific process"
+    )
+    status_parser.add_argument(
+        "-w", "--watch", action="store_true", help="Watch mode (auto-refresh)"
+    )
+
+    # logs
+    logs_parser = subparsers.add_parser("logs", help="View process logs")
+    logs_parser.add_argument("name", help="Name of the process")
+    logs_parser.add_argument(
+        "-f", "--follow", action="store_true", help="Follow log output"
+    )
+    logs_parser.add_argument(
+        "-n", "--lines", type=int, default=50, help="Number of lines (default: 50)"
+    )
+    logs_parser.add_argument("--stdout", action="store_true", help="Show only stdout")
+    logs_parser.add_argument("--stderr", action="store_true", help="Show only stderr")
+
+    # follow
+    follow_parser = subparsers.add_parser(
+        "follow", aliases=["tail"], help="Follow logs (shorthand for logs -f)"
+    )
+    follow_parser.add_argument("name", help="Name of the process")
+    follow_parser.add_argument(
+        "-n", "--lines", type=int, default=10, help="Initial lines (default: 10)"
+    )
+    follow_parser.add_argument("--stdout", action="store_true", help="Show only stdout")
+    follow_parser.add_argument("--stderr", action="store_true", help="Show only stderr")
+
+    # clean
+    subparsers.add_parser("clean", help="Remove stopped processes from list")
+
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete a process completely")
+    delete_parser.add_argument("name", help="Name of the process")
+    delete_parser.add_argument(
+        "-y", "--yes", action="store_true", help="Skip confirmation"
+    )
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    handlers = {
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
+        "status": cmd_status,
+        "ls": cmd_status,
+        "list": cmd_status,
+        "logs": cmd_logs,
+        "follow": cmd_logs_follow,
+        "tail": cmd_logs_follow,
+        "clean": cmd_clean,
+        "delete": cmd_delete,
+    }
+
+    handler = handlers.get(args.command)
+    if handler:
+        return handler(args)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
