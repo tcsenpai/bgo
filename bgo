@@ -12,7 +12,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import time
+import tty
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -133,6 +135,18 @@ def get_process_info(pid: int) -> dict:
     except Exception:
         pass
     return {"cpu": "-", "mem": "-", "time": "-"}
+
+
+def _looks_like_command(arg: str) -> bool:
+    """Check if an argument looks like an executable command (not a plain name).
+    Returns True if the arg is a path, has an extension, or resolves via which."""
+    if os.sep in arg or arg.startswith("./"):
+        return True
+    if "." in arg:
+        return True
+    if shutil.which(arg):
+        return True
+    return False
 
 
 def derive_name(cmd: list[str]) -> str:
@@ -574,6 +588,291 @@ def cmd_clean(args):
     return 0
 
 
+def cmd_resurrect(args):
+    """Restart all processes that were running before shutdown/reboot."""
+    procs = load_all_procs()
+
+    if not procs:
+        print("No processes registered.")
+        return 0
+
+    candidates = []
+    for name, info in procs.items():
+        pid = info.get("pid")
+        if not is_running(pid) and info.get("status") == "running":
+            candidates.append((name, info))
+
+    if not candidates:
+        print("No processes to resurrect (all running or already stopped).")
+        return 0
+
+    print(f"🔄 Resurrecting {len(candidates)} process(es)...")
+    failures = 0
+
+    for name, info in candidates:
+        restart_args = argparse.Namespace(
+            name=name,
+            command=info["command"],
+            cwd=info.get("cwd"),
+        )
+        result = cmd_start(restart_args)
+        if result != 0:
+            failures += 1
+
+    if failures:
+        print(f"\n⚠️  {failures}/{len(candidates)} process(es) failed to start")
+        return 1
+
+    print(f"\n✅ All {len(candidates)} process(es) resurrected")
+    return 0
+
+
+def _interactive_multiselect(title: str, options: list[tuple[str, str]]) -> list[str] | None:
+    """Render a TTY checkbox list. Returns selected keys, or None if cancelled.
+
+    options: list of (key, label) tuples. Keys returned; labels displayed.
+    Controls: ↑/↓ navigate, space toggle, a toggle-all, enter confirm, q/esc cancel.
+    Falls back to a numbered prompt if stdin/stdout isn't a TTY.
+    """
+    if not options:
+        return []
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # Non-TTY fallback: numbered prompt
+        print(title)
+        for i, (_, label) in enumerate(options, 1):
+            print(f"  {i}) {label}")
+        print("Enter numbers (comma/space separated), 'a' for all, blank to cancel:")
+        try:
+            raw = input("> ").strip()
+        except EOFError:
+            return None
+        if not raw:
+            return None
+        if raw.lower() == "a":
+            return [k for k, _ in options]
+        picks: list[str] = []
+        for tok in re.split(r"[,\s]+", raw):
+            if not tok:
+                continue
+            try:
+                idx = int(tok) - 1
+                if 0 <= idx < len(options):
+                    picks.append(options[idx][0])
+            except ValueError:
+                pass
+        return picks
+
+    selected = [False] * len(options)
+    cursor = 0
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def render(first: bool):
+        if not first:
+            # Move cursor up to redraw
+            sys.stdout.write(f"\033[{len(options) + 3}A")
+        sys.stdout.write("\033[J")  # clear from cursor down
+        sys.stdout.write(f"{title}\n")
+        sys.stdout.write(color("gray", "  ↑/↓ move · space toggle · a all · enter confirm · q cancel\n"))
+        for i, (_, label) in enumerate(options):
+            mark = color("green", "[x]") if selected[i] else "[ ]"
+            line = f"  {mark} {label}"
+            if i == cursor:
+                line = color("blue", "▶ ") + line.lstrip()
+            else:
+                line = "  " + line
+            sys.stdout.write(line + "\n")
+        sys.stdout.write(color("gray", f"  ({sum(selected)} selected)\n"))
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)
+        render(first=True)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                # Escape sequence (arrow key) or plain ESC
+                next1 = sys.stdin.read(1)
+                if next1 == "":
+                    return None  # ESC alone
+                if next1 == "[":
+                    arrow = sys.stdin.read(1)
+                    if arrow == "A":
+                        cursor = (cursor - 1) % len(options)
+                    elif arrow == "B":
+                        cursor = (cursor + 1) % len(options)
+                    render(first=False)
+                continue
+            if ch == " ":
+                selected[cursor] = not selected[cursor]
+                render(first=False)
+            elif ch.lower() == "a":
+                new_state = not all(selected)
+                selected = [new_state] * len(options)
+                render(first=False)
+            elif ch in ("\r", "\n"):
+                return [options[i][0] for i, s in enumerate(selected) if s]
+            elif ch.lower() == "q" or ch == "\x03":  # q or Ctrl-C
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _restart_one(name: str, info: dict) -> int:
+    """Stop (if running) then start a single proc. Returns 0 on success."""
+    pid = info.get("pid")
+    if is_running(pid):
+        kill_process(pid, info.get("pgid"))
+    restart_args = argparse.Namespace(
+        name=name,
+        command=info["command"],
+        cwd=info.get("cwd"),
+    )
+    return cmd_start(restart_args)
+
+
+def cmd_restart_stopped(args):
+    """Restart procs that are not currently running.
+
+    Includes both explicitly stopped procs AND procs whose state says
+    'running' but whose PID is dead (e.g., killed by reboot).
+    """
+    procs = load_all_procs()
+
+    if not procs:
+        print("No processes registered.")
+        return 0
+
+    candidates = [
+        (name, info) for name, info in procs.items()
+        if not is_running(info.get("pid"))
+    ]
+
+    requested = getattr(args, "names", None) or []
+    use_all = getattr(args, "all", False)
+
+    if requested:
+        cand_map = dict(candidates)
+        unknown = [n for n in requested if n not in procs]
+        not_stopped = [n for n in requested if n in procs and n not in cand_map]
+        if unknown:
+            print(f"{color('red', '❌')} Unknown process(es): {', '.join(unknown)}")
+            return 1
+        if not_stopped:
+            print(f"{color('yellow', '⚠️')}  Skipping (already running): {', '.join(not_stopped)}")
+        targets = [(n, cand_map[n]) for n in requested if n in cand_map]
+        if not targets:
+            print("Nothing to restart.")
+            return 0
+    elif not candidates:
+        print("No stopped processes to restart.")
+        return 0
+    elif use_all:
+        targets = candidates
+    else:
+        options = []
+        for name, info in candidates:
+            cmd_str = " ".join(info.get("command", []))
+            stopped_at = info.get("stopped_at") or info.get("started_at") or "?"
+            label = f"{name:<20} {color('gray', stopped_at[:19])}  {cmd_str[:60]}"
+            options.append((name, label))
+        picks = _interactive_multiselect(
+            color("bold", f"Select stopped processes to restart ({len(candidates)} available):"),
+            options,
+        )
+        if picks is None:
+            print("Cancelled.")
+            return 0
+        if not picks:
+            print("Nothing selected.")
+            return 0
+        cand_map = dict(candidates)
+        targets = [(n, cand_map[n]) for n in picks]
+
+    if not targets:
+        print("No matching stopped processes.")
+        return 0
+
+    print(f"🔄 Restarting {len(targets)} process(es)...")
+    failures = 0
+    for name, info in targets:
+        if _restart_one(name, info) != 0:
+            failures += 1
+
+    if failures:
+        print(f"\n⚠️  {failures}/{len(targets)} process(es) failed to start")
+        return 1
+    print(f"\n✅ All {len(targets)} process(es) restarted")
+    return 0
+
+
+def cmd_restart_last(args):
+    """Restart processes ordered by most-recent-first.
+
+    With --all: restart every not-running proc in most-recent order.
+    Otherwise: interactive menu sorted by most-recent-first (no pre-check).
+    """
+    procs = load_all_procs()
+
+    if not procs:
+        print("No processes registered.")
+        return 0
+
+    candidates = [
+        (name, info) for name, info in procs.items()
+        if not is_running(info.get("pid"))
+    ]
+
+    if not candidates:
+        print("No stopped processes to restart.")
+        return 0
+
+    def sort_key(item):
+        _, info = item
+        return info.get("stopped_at") or info.get("started_at") or ""
+
+    candidates.sort(key=sort_key, reverse=True)
+
+    use_all = getattr(args, "all", False)
+
+    if use_all:
+        targets = candidates
+    else:
+        options = []
+        for name, info in candidates:
+            cmd_str = " ".join(info.get("command", []))
+            ts = info.get("stopped_at") or info.get("started_at") or "?"
+            label = f"{name:<20} {color('gray', ts[:19])}  {cmd_str[:60]}"
+            options.append((name, label))
+        picks = _interactive_multiselect(
+            color("bold", f"Select processes to restart (most recent first, {len(candidates)} available):"),
+            options,
+        )
+        if picks is None:
+            print("Cancelled.")
+            return 0
+        if not picks:
+            print("Nothing selected.")
+            return 0
+        cand_map = dict(candidates)
+        targets = [(n, cand_map[n]) for n in picks]
+
+    print(f"🔄 Restarting {len(targets)} process(es)...")
+    failures = 0
+    for name, info in targets:
+        if _restart_one(name, info) != 0:
+            failures += 1
+
+    if failures:
+        print(f"\n⚠️  {failures}/{len(targets)} process(es) failed to start")
+        return 1
+    print(f"\n✅ All {len(targets)} process(es) restarted")
+    return 0
+
+
 def cmd_delete(args):
     """Delete a process from state (stop if running first)."""
     name = args.name
@@ -605,8 +904,9 @@ def main():
     init_dirs()
 
     known_commands = {
-        "start", "stop", "restart", "status", "logs", "clean",
-        "delete", "ls", "list", "follow", "tail", "-h", "--help",
+        "start", "stop", "restart", "restart-stopped", "restart-last",
+        "status", "logs", "clean", "delete", "resurrect",
+        "ls", "list", "follow", "tail", "-h", "--help",
     }
 
     # Direct mode: bgo <n> -- <cmd>   OR   bgo <cmd> [args...]
@@ -626,9 +926,19 @@ def main():
             args = argparse.Namespace(name=name, command=command, cwd=None)
             return cmd_start(args)
         else:
-            # No '--' → auto-derive name from binary
-            command = remaining
-            name = derive_name(command)
+            # No '--' → heuristic: if first arg is NOT an executable but
+            # second arg IS (or looks like a path/command), treat first as name.
+            # e.g. bgo myapp python3 server.py --port 8080
+            #      → name="myapp", command=["python3", "server.py", "--port", "8080"]
+            # Otherwise treat everything as the command with auto-derived name.
+            # e.g. bgo python3 server.py --port 8080
+            #      → name="python3", command=["python3", "server.py", "--port", "8080"]
+            if len(remaining) >= 2 and not _looks_like_command(remaining[0]) and _looks_like_command(remaining[1]):
+                name = remaining[0]
+                command = remaining[1:]
+            else:
+                command = remaining
+                name = derive_name(command)
             args = argparse.Namespace(name=name, command=command, cwd=None)
             return cmd_start(args)
 
@@ -639,6 +949,7 @@ def main():
         epilog="""
 Examples:
   bgo python3 server.py                    # Start (auto-name: 'server')
+  bgo myapp python3 server.py --port 8080  # Start with name + args
   bgo start myapp -- python3 server.py     # Start with explicit name
   bgo myapp -- ./api-server --port 8080    # Shorthand with name
   bgo status                               # Show all processes
@@ -649,8 +960,14 @@ Examples:
   bgo stop myapp                           # Stop (SIGTERM → SIGKILL)
   bgo stop myapp --force                   # Force kill (SIGKILL)
   bgo restart myapp                        # Restart a process
+  bgo restart-stopped                      # Pick stopped procs to restart (interactive)
+  bgo restart-stopped --all                # Restart all stopped procs
+  bgo restart-stopped foo bar              # Restart named stopped procs
+  bgo restart-last                         # Pick from most-recent-first menu
+  bgo restart-last --all                   # Restart all not-running, recent first
   bgo delete myapp                         # Remove from list + logs
   bgo clean                                # Remove all stopped entries
+  bgo resurrect                            # Restart all previously running procs
         """,
     )
 
@@ -674,6 +991,25 @@ Examples:
     # restart
     restart_parser = subparsers.add_parser("restart", help="Restart a process")
     restart_parser.add_argument("name", help="Name of the process")
+
+    # restart-stopped
+    rs_parser = subparsers.add_parser(
+        "restart-stopped",
+        help="Restart stopped processes (interactive menu, --all, or by name)",
+    )
+    rs_parser.add_argument("names", nargs="*", help="Specific process names (optional)")
+    rs_parser.add_argument(
+        "-a", "--all", action="store_true", help="Restart all stopped processes without prompting"
+    )
+
+    # restart-last
+    rl_parser = subparsers.add_parser(
+        "restart-last",
+        help="Restart processes ordered by most recent (interactive menu or --all)",
+    )
+    rl_parser.add_argument(
+        "-a", "--all", action="store_true", help="Restart all not-running processes (most recent first)"
+    )
 
     # status
     status_parser = subparsers.add_parser(
@@ -712,6 +1048,9 @@ Examples:
     # clean
     subparsers.add_parser("clean", help="Remove stopped processes from list")
 
+    # resurrect
+    subparsers.add_parser("resurrect", help="Restart all processes that were running before shutdown")
+
     # delete
     delete_parser = subparsers.add_parser("delete", help="Delete a process completely")
     delete_parser.add_argument("name", help="Name of the process")
@@ -729,6 +1068,8 @@ Examples:
         "start": cmd_start,
         "stop": cmd_stop,
         "restart": cmd_restart,
+        "restart-stopped": cmd_restart_stopped,
+        "restart-last": cmd_restart_last,
         "status": cmd_status,
         "ls": cmd_status,
         "list": cmd_status,
@@ -736,6 +1077,7 @@ Examples:
         "follow": cmd_logs_follow,
         "tail": cmd_logs_follow,
         "clean": cmd_clean,
+        "resurrect": cmd_resurrect,
         "delete": cmd_delete,
     }
 

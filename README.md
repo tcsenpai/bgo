@@ -55,6 +55,11 @@ bgo delete myserver
 | `bgo stop <name>` | Stop a process (SIGTERM) |
 | `bgo stop <name> -f` | Force kill (SIGKILL) |
 | `bgo restart <name>` | Restart a process |
+| `bgo restart-stopped` | Pick stopped procs to restart (interactive menu) |
+| `bgo restart-stopped --all` | Restart every stopped/dead proc |
+| `bgo restart-stopped <name>...` | Restart specific stopped procs by name |
+| `bgo restart-last` | Interactive menu of procs sorted most-recent-first |
+| `bgo restart-last --all` | Restart all not-running procs in recent order |
 | `bgo logs <name>` | Show last 50 lines |
 | `bgo logs <name> -f` | Follow logs (tail -f) |
 | `bgo logs <name> -n 100` | Show last 100 lines |
