@@ -739,13 +739,17 @@ def cmd_restart(args):
         print(f"{color('red', '❌')} No process named '{name}' found")
         return 1
 
-    # Clear errored state and reset restart counter (manual intervention = clean slate)
+    # Clear errored state. Restart counter is preserved by default so
+    # operators can see chronic crashers across manual restarts; pass
+    # --reset-counters to wipe it explicitly.
+    reset = getattr(args, "reset_counters", False)
     if "watch" in info:
         info["watch"]["errored"] = False
         info["watch"]["error_reason"] = None
         info["watch"]["last_stderr_tail"] = None
-        info["watch"]["restarts"] = 0
-        info["watch"]["last_restart_at"] = None
+        if reset:
+            info["watch"]["restarts"] = 0
+            info["watch"]["last_restart_at"] = None
         save_proc(name, info)
 
     # Stop watcher first to prevent restart race
@@ -1700,6 +1704,10 @@ Watch mode (auto-restart on crash):
     # restart
     restart_parser = subparsers.add_parser("restart", help="Restart a process")
     restart_parser.add_argument("name", help="Name of the process")
+    restart_parser.add_argument(
+        "--reset-counters", dest="reset_counters", action="store_true",
+        help="Also zero the watch restart counter (default: preserve)",
+    )
 
     # watch
     watch_parser = subparsers.add_parser(
