@@ -74,6 +74,20 @@ def log_path(name: str, stream: str = "out") -> Path:
     return LOGS_DIR / f"{name}.{stream}.log"
 
 
+def watcher_log_path(name: str) -> Path:
+    return LOGS_DIR / f"{name}.watcher.log"
+
+
+def watcher_log(name: str, msg: str):
+    """Append timestamped line to watcher log."""
+    try:
+        ts = datetime.now().isoformat(timespec="seconds")
+        with open(watcher_log_path(name), "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except OSError:
+        pass
+
+
 def load_proc(name: str) -> dict | None:
     pf = proc_file(name)
     if not pf.exists():
@@ -93,6 +107,7 @@ def delete_proc(name: str):
     proc_file(name).unlink(missing_ok=True)
     for stream in ("out", "err"):
         log_path(name, stream).unlink(missing_ok=True)
+    watcher_log_path(name).unlink(missing_ok=True)
 
 
 def load_all_procs() -> dict[str, dict]:
@@ -111,13 +126,26 @@ def load_all_procs() -> dict[str, dict]:
 
 
 def is_running(pid: int | None) -> bool:
+    """Return True if pid is alive AND not a zombie/defunct process."""
     if pid is None:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, OSError):
         return False
+    # On Linux, filter out zombies via /proc/<pid>/stat (state 'Z')
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read()
+        # stat format: pid (comm) state ...  comm may contain spaces/parens.
+        rparen = stat.rfind(")")
+        if rparen != -1:
+            state = stat[rparen + 2 : rparen + 3]
+            if state == "Z":
+                return False
+    except (OSError, IndexError):
+        pass  # non-Linux or transient — assume alive based on kill check
+    return True
 
 
 def get_process_info(pid: int) -> dict:
@@ -202,6 +230,277 @@ def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
     return not is_running(pid)
 
 
+# --- Watch helpers ---
+
+
+WATCH_DEFAULTS = {
+    "interval": 3,
+    "min_uptime": 2,
+    "on_fast_crash": "backoff",  # backoff | stop | retry
+}
+BACKOFF_SCHEDULE = [2, 4, 8]
+TAIL_BYTES = 2048
+
+
+def _default_watch_config(overrides: dict | None = None) -> dict:
+    """Build a fresh watch config block with defaults."""
+    cfg = {
+        "enabled": True,
+        "interval": WATCH_DEFAULTS["interval"],
+        "min_uptime": WATCH_DEFAULTS["min_uptime"],
+        "on_fast_crash": WATCH_DEFAULTS["on_fast_crash"],
+        "watcher_pid": None,
+        "watcher_pgid": None,
+        "restarts": 0,
+        "last_restart_at": None,
+        "errored": False,
+        "error_reason": None,
+        "last_stderr_tail": None,
+    }
+    if overrides:
+        for k, v in overrides.items():
+            if v is not None and k in cfg:
+                cfg[k] = v
+    return cfg
+
+
+def _spawn_watcher(name: str) -> tuple[int | None, int | None]:
+    """Detach a watcher process for `name`. Returns (pid, pgid)."""
+    try:
+        wlog = open(watcher_log_path(name), "a")
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "__watcher__", name],
+            stdout=wlog,
+            stderr=wlog,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        wlog.close()
+    except Exception as e:
+        watcher_log(name, f"failed to spawn watcher: {e}")
+        return None, None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    return proc.pid, pgid
+
+
+def _kill_watcher(info: dict) -> None:
+    """Kill the watcher associated with `info` (if any), in-place clears pids."""
+    w = info.get("watch") or {}
+    wpid = w.get("watcher_pid")
+    wpgid = w.get("watcher_pgid")
+    if wpid and is_running(wpid):
+        kill_process(wpid, wpgid)
+    if "watch" in info:
+        info["watch"]["watcher_pid"] = None
+        info["watch"]["watcher_pgid"] = None
+
+
+def _tail_stderr(name: str, nbytes: int = TAIL_BYTES) -> str:
+    """Return last nbytes of stderr log, stripped."""
+    lf = log_path(name, "err")
+    if not lf.exists():
+        return ""
+    try:
+        with open(lf, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read().decode("utf-8", errors="replace")
+        # strip leading partial line
+        if size > nbytes and "\n" in data:
+            data = data[data.index("\n") + 1:]
+        return data.strip()
+    except OSError:
+        return ""
+
+
+def _restart_proc_inplace(info: dict) -> tuple[int | None, int | None, str | None]:
+    """Spawn target command again, return (pid, pgid, err_msg)."""
+    name = info["name"]
+    command = info["command"]
+    cwd = info.get("cwd") or os.getcwd()
+    stdout_log = log_path(name, "out")
+    stderr_log = log_path(name, "err")
+    try:
+        out_f = open(stdout_log, "a")
+        err_f = open(stderr_log, "a")
+        ts = datetime.now().isoformat()
+        marker = f"\n=== [{ts}] [watch restart] {' '.join(command)} ===\n"
+        out_f.write(marker)
+        err_f.write(marker)
+        out_f.flush()
+        err_f.flush()
+        proc = subprocess.Popen(
+            command,
+            stdout=out_f,
+            stderr=err_f,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=cwd,
+        )
+        out_f.close()
+        err_f.close()
+    except FileNotFoundError:
+        return None, None, f"command not found: {command[0]}"
+    except PermissionError:
+        return None, None, f"permission denied: {command[0]}"
+    except Exception as e:
+        return None, None, f"failed to start: {e}"
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    return proc.pid, pgid, None
+
+
+def cmd_watcher_loop(name: str) -> int:
+    """Internal: watcher loop entry point. Invoked as `bgo __watcher__ <name>`."""
+    # Auto-reap children so dead procs disappear instead of lingering as zombies
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
+    info = load_proc(name)
+    if not info or not info.get("watch", {}).get("enabled"):
+        return 0
+
+    watcher_log(name, f"watcher started for pid={info.get('pid')}")
+    backoff_idx = 0
+    current_started_at = info.get("started_at")
+    needs_early_check = True
+
+    def _start_epoch() -> float:
+        try:
+            s = current_started_at.replace("Z", "+00:00")
+            return datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return time.time()
+
+    while True:
+        interval = info.get("watch", {}).get("interval", WATCH_DEFAULTS["interval"])
+        min_uptime_cfg = info.get("watch", {}).get("min_uptime", WATCH_DEFAULTS["min_uptime"])
+
+        if needs_early_check:
+            # High-frequency poll during the min_uptime window so fast-crashes
+            # are caught with accurate short uptime readings (even when the
+            # routine poll interval is larger than min_uptime).
+            deadline = _start_epoch() + min_uptime_cfg
+            died_early = False
+            while time.time() < deadline:
+                time.sleep(0.2)
+                cur_pid = info.get("pid")
+                if not is_running(cur_pid):
+                    died_early = True
+                    break
+            needs_early_check = False
+            if not died_early:
+                # Sleep the remainder of the normal interval
+                remaining = max(0.0, (_start_epoch() + min_uptime_cfg + interval) - time.time())
+                if remaining > 0:
+                    time.sleep(min(remaining, interval))
+        else:
+            time.sleep(max(1, interval))
+
+        info = load_proc(name)
+        if not info:
+            watcher_log(name, "proc state vanished; exiting")
+            return 0
+        w = info.get("watch") or {}
+        if not w.get("enabled"):
+            watcher_log(name, "watch disabled; exiting")
+            return 0
+        if info.get("status") == "stopped":
+            watcher_log(name, "proc manually stopped; exiting")
+            return 0
+
+        pid = info.get("pid")
+        if is_running(pid):
+            continue
+
+        # Process died. Compute uptime.
+        try:
+            started = datetime.fromisoformat(current_started_at.replace("Z", "+00:00"))
+            uptime = (datetime.now(timezone.utc) - started).total_seconds()
+        except Exception:
+            uptime = 0.0
+
+        min_uptime = w.get("min_uptime", WATCH_DEFAULTS["min_uptime"])
+        mode = w.get("on_fast_crash", WATCH_DEFAULTS["on_fast_crash"])
+        fast = uptime < min_uptime
+
+        if fast:
+            tail = _tail_stderr(name)
+            watcher_log(name, f"fast-crash: uptime={uptime:.2f}s mode={mode}")
+
+            if mode == "stop":
+                info["watch"]["errored"] = True
+                info["watch"]["error_reason"] = f"fast-crash (uptime {uptime:.2f}s, mode=stop)"
+                info["watch"]["last_stderr_tail"] = tail
+                info["watch"]["watcher_pid"] = None
+                info["watch"]["watcher_pgid"] = None
+                info["status"] = "stopped"
+                save_proc(name, info)
+                watcher_log(name, "errored; exiting")
+                return 0
+
+            if mode == "backoff":
+                if backoff_idx >= len(BACKOFF_SCHEDULE):
+                    info["watch"]["errored"] = True
+                    info["watch"]["error_reason"] = f"{len(BACKOFF_SCHEDULE) + 1} consecutive fast-crashes"
+                    info["watch"]["last_stderr_tail"] = tail
+                    info["watch"]["watcher_pid"] = None
+                    info["watch"]["watcher_pgid"] = None
+                    info["status"] = "stopped"
+                    save_proc(name, info)
+                    watcher_log(name, "backoff exhausted; errored; exiting")
+                    return 0
+                wait = BACKOFF_SCHEDULE[backoff_idx]
+                watcher_log(name, f"backoff sleep {wait}s (step {backoff_idx + 1}/{len(BACKOFF_SCHEDULE)})")
+                time.sleep(wait)
+                backoff_idx += 1
+            elif mode == "retry":
+                wait = BACKOFF_SCHEDULE[min(backoff_idx, len(BACKOFF_SCHEDULE) - 1)]
+                watcher_log(name, f"retry mode: sleep {wait}s")
+                time.sleep(wait)
+                backoff_idx = min(backoff_idx + 1, len(BACKOFF_SCHEDULE) - 1)
+        else:
+            backoff_idx = 0
+
+        # Reload (state may have shifted during sleep)
+        info = load_proc(name)
+        if not info or info.get("status") == "stopped" or not info.get("watch", {}).get("enabled"):
+            watcher_log(name, "state changed during backoff; exiting")
+            return 0
+
+        new_pid, new_pgid, err = _restart_proc_inplace(info)
+        if err:
+            watcher_log(name, f"restart failed: {err}")
+            info["watch"]["errored"] = True
+            info["watch"]["error_reason"] = err
+            info["watch"]["last_stderr_tail"] = _tail_stderr(name)
+            info["watch"]["watcher_pid"] = None
+            info["watch"]["watcher_pgid"] = None
+            info["status"] = "stopped"
+            save_proc(name, info)
+            return 0
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        info["pid"] = new_pid
+        info["pgid"] = new_pgid
+        info["started_at"] = now_iso
+        info["status"] = "running"
+        info["watch"]["restarts"] = info["watch"].get("restarts", 0) + 1
+        info["watch"]["last_restart_at"] = now_iso
+        save_proc(name, info)
+        current_started_at = now_iso
+        needs_early_check = True
+        watcher_log(name, f"restart #{info['watch']['restarts']} pid={new_pid} (prev uptime {uptime:.2f}s)")
+
+
 # --- Commands ---
 
 
@@ -279,6 +578,29 @@ def cmd_start(args):
     except OSError:
         pgid = None
 
+    # Preserve prior watch config if restart, otherwise build from args/existing
+    prior_watch = (existing or {}).get("watch") if existing else None
+    want_watch = getattr(args, "watch", False)
+    watch_overrides = {
+        "interval": getattr(args, "interval", None),
+        "min_uptime": getattr(args, "min_uptime", None),
+        "on_fast_crash": getattr(args, "on_fast_crash", None),
+    }
+
+    if want_watch:
+        watch_block = _default_watch_config(watch_overrides)
+        # Carry forward restart counters? No — fresh start resets.
+    elif prior_watch and prior_watch.get("enabled"):
+        # Internal restart path (cmd_restart/_restart_one) preserves watch
+        watch_block = dict(prior_watch)
+        watch_block["watcher_pid"] = None
+        watch_block["watcher_pgid"] = None
+        watch_block["errored"] = False
+        watch_block["error_reason"] = None
+        watch_block["last_stderr_tail"] = None
+    else:
+        watch_block = None
+
     info = {
         "name": name,
         "pid": process.pid,
@@ -288,9 +610,27 @@ def cmd_start(args):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running",
     }
+    if watch_block:
+        info["watch"] = watch_block
     save_proc(name, info)
 
     print(f"{color('green', '✅')} Started '{name}' (PID: {process.pid})")
+
+    if watch_block:
+        wpid, wpgid = _spawn_watcher(name)
+        if wpid:
+            info["watch"]["watcher_pid"] = wpid
+            info["watch"]["watcher_pgid"] = wpgid
+            save_proc(name, info)
+            print(
+                f"   {color('blue', '👁')} Watching "
+                f"(interval={watch_block['interval']}s, "
+                f"min-uptime={watch_block['min_uptime']}s, "
+                f"on-fast-crash={watch_block['on_fast_crash']})"
+            )
+        else:
+            print(f"   {color('yellow', '⚠️')}  Failed to spawn watcher")
+
     print(f"   Logs: bgo logs {name}")
     return 0
 
@@ -315,12 +655,18 @@ def cmd_stop(args):
     force = getattr(args, "force", False)
     pgid = info.get("pgid")
 
+    # Mark stopped BEFORE killing so watcher (if any) sees the flag and exits.
+    info["status"] = "stopped"
+    save_proc(name, info)
+
+    # Kill watcher first so it doesn't observe the death and try to restart.
+    _kill_watcher(info)
+
     killed = kill_process(pid, pgid, force=force)
 
     if killed:
         label = "💀 Killed" if force else "🛑 Stopped"
         print(f"{label} '{name}' (PID: {pid})")
-        info["status"] = "stopped"
         info["stopped_at"] = datetime.now(timezone.utc).isoformat()
         save_proc(name, info)
     else:
@@ -333,7 +679,7 @@ def cmd_stop(args):
 
 
 def cmd_restart(args):
-    """Restart a process."""
+    """Restart a process. Clears errored state and re-spawns watcher if enabled."""
     name = args.name
     info = load_proc(name)
 
@@ -341,19 +687,117 @@ def cmd_restart(args):
         print(f"{color('red', '❌')} No process named '{name}' found")
         return 1
 
-    # Stop if running
+    # Clear errored state and reset restart counter (manual intervention = clean slate)
+    if "watch" in info:
+        info["watch"]["errored"] = False
+        info["watch"]["error_reason"] = None
+        info["watch"]["last_stderr_tail"] = None
+        info["watch"]["restarts"] = 0
+        info["watch"]["last_restart_at"] = None
+        save_proc(name, info)
+
+    # Stop watcher first to prevent restart race
+    _kill_watcher(info)
+    save_proc(name, info)
+
+    # Stop target if running
     pid = info.get("pid")
     if is_running(pid):
         print(f"🛑 Stopping '{name}'...")
         kill_process(pid, info.get("pgid"))
 
-    # Restart with same config
+    # cmd_start picks up info["watch"] via load_proc(existing) and re-spawns watcher
     restart_args = argparse.Namespace(
         name=name,
         command=info["command"],
         cwd=info.get("cwd"),
     )
     return cmd_start(restart_args)
+
+
+def cmd_watch(args):
+    """Attach a watcher to an existing process (or replace its config)."""
+    name = args.name
+    info = load_proc(name)
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+
+    pid = info.get("pid")
+    if not is_running(pid):
+        print(f"{color('yellow', '⚠️')}  Process '{name}' is not running. Start it first.")
+        return 1
+
+    # Kill any prior watcher
+    _kill_watcher(info)
+
+    reset = getattr(args, "reset", False)
+    prior = info.get("watch") or {}
+    overrides = {
+        "interval": getattr(args, "interval", None),
+        "min_uptime": getattr(args, "min_uptime", None),
+        "on_fast_crash": getattr(args, "on_fast_crash", None),
+    }
+
+    if reset or not prior:
+        watch_block = _default_watch_config(overrides)
+    else:
+        watch_block = dict(prior)
+        watch_block["enabled"] = True
+        watch_block["errored"] = False
+        watch_block["error_reason"] = None
+        watch_block["last_stderr_tail"] = None
+        for k, v in overrides.items():
+            if v is not None:
+                watch_block[k] = v
+
+    info["watch"] = watch_block
+    save_proc(name, info)
+
+    wpid, wpgid = _spawn_watcher(name)
+    if not wpid:
+        print(f"{color('red', '❌')} Failed to spawn watcher")
+        return 1
+    info["watch"]["watcher_pid"] = wpid
+    info["watch"]["watcher_pgid"] = wpgid
+    save_proc(name, info)
+    print(
+        f"{color('blue', '👁')} Watching '{name}' "
+        f"(interval={watch_block['interval']}s, "
+        f"min-uptime={watch_block['min_uptime']}s, "
+        f"on-fast-crash={watch_block['on_fast_crash']})"
+    )
+    return 0
+
+
+def cmd_unwatch(args):
+    """Detach watcher from a process (keeps the process running)."""
+    name = args.name
+    info = load_proc(name)
+    if not info:
+        print(f"{color('red', '❌')} No process named '{name}' found")
+        return 1
+    if not info.get("watch", {}).get("enabled"):
+        print(f"{color('yellow', '⚠️')}  '{name}' is not being watched")
+        return 0
+    _kill_watcher(info)
+    info["watch"]["enabled"] = False
+    save_proc(name, info)
+    print(f"{color('gray', '👁  unwatched')} '{name}'")
+    return 0
+
+
+def _watch_cell(info: dict) -> str:
+    """Render the WATCH column cell for the status table."""
+    w = info.get("watch")
+    if not w or not w.get("enabled"):
+        return "-"
+    if w.get("errored"):
+        return color("red", "⚠ errored")
+    wpid = w.get("watcher_pid")
+    if wpid and not is_running(wpid):
+        return color("yellow", "! dead")
+    return color("green", f"✓ {w.get('restarts', 0)}")
 
 
 def cmd_status(args):
@@ -382,7 +826,8 @@ def cmd_status(args):
     # Table view
     term_width = shutil.get_terminal_size().columns
     name_width = max(12, max(len(n) for n in procs.keys()) + 2)
-    cmd_width = max(20, term_width - name_width - 55)
+    watch_width = 12
+    cmd_width = max(20, term_width - name_width - 55 - watch_width - 1)
 
     header = (
         f"{color('bold', 'NAME'):<{name_width}} "
@@ -391,6 +836,7 @@ def cmd_status(args):
         f"{color('bold', 'CPU'):<7} "
         f"{color('bold', 'MEM'):<7} "
         f"{color('bold', 'UPTIME'):<12} "
+        f"{color('bold', 'WATCH'):<{watch_width + 9}} "  # +9 for ANSI overhead in cells
         f"{color('bold', 'COMMAND')}"
     )
     print(header)
@@ -398,11 +844,16 @@ def cmd_status(args):
 
     running_count = 0
     stopped_count = 0
+    errored_procs = []
 
     for name, info in sorted(procs.items()):
         pid = info.get("pid")
         cmd_str = " ".join(info.get("command", []))
         cmd_str = truncate(cmd_str, cmd_width)
+        watch_str = _watch_cell(info)
+        w = info.get("watch") or {}
+        if w.get("errored"):
+            errored_procs.append((name, w.get("error_reason", "unknown")))
 
         if is_running(pid):
             running_count += 1
@@ -415,6 +866,7 @@ def cmd_status(args):
                 f"{proc_info['cpu']:<7} "
                 f"{proc_info['mem']:<7} "
                 f"{proc_info['time']:<12} "
+                f"{watch_str:<{watch_width + 9}} "
                 f"{cmd_str}"
             )
         else:
@@ -427,6 +879,7 @@ def cmd_status(args):
                 f"{'-':<7} "
                 f"{'-':<7} "
                 f"{'-':<12} "
+                f"{watch_str:<{watch_width + 9}} "
                 f"{color('gray', cmd_str)}"
             )
             # Update status in state
@@ -437,6 +890,12 @@ def cmd_status(args):
     print(
         f"Total: {len(procs)} | {color('green', 'online')}: {running_count} | {color('red', 'stopped')}: {stopped_count}"
     )
+    if errored_procs:
+        print()
+        print(color("red", f"⚠ {len(errored_procs)} errored:"))
+        for n, reason in errored_procs:
+            print(f"   {color('red', n)} — {reason}")
+            print(f"     {color('gray', f'bgo logs {n} --watcher   |   bgo restart {n}')}")
 
     return 0
 
@@ -467,6 +926,47 @@ def _print_proc_detail(info: dict):
             size = lf.stat().st_size
             print(f"  {label}:  {_human_size(size)} ({lf})")
 
+    w = info.get("watch")
+    if w:
+        print()
+        print(f"{color('bold', 'Watch:')}")
+        enabled = w.get("enabled")
+        if enabled:
+            print(
+                f"  Enabled:   yes "
+                f"(interval {w.get('interval')}s, "
+                f"min-uptime {w.get('min_uptime')}s, "
+                f"mode {w.get('on_fast_crash')})"
+            )
+        else:
+            print(f"  Enabled:   no")
+        wpid = w.get("watcher_pid")
+        if wpid:
+            alive = is_running(wpid)
+            wstate = color("green", "alive") if alive else color("yellow", "dead")
+            print(f"  Watcher:   PID {wpid} ({wstate})")
+        else:
+            print(f"  Watcher:   {color('gray', 'not running')}")
+        print(f"  Restarts:  {w.get('restarts', 0)}")
+        if w.get("last_restart_at"):
+            print(f"  Last:      {w['last_restart_at']}")
+        if w.get("errored"):
+            print(f"  Errored:   {color('red', 'YES')} — {w.get('error_reason')}")
+            tail = w.get("last_stderr_tail")
+            if tail:
+                print(f"  Last err:")
+                for line in tail.splitlines()[-5:]:
+                    print(f"    {color('gray', line)}")
+            nm = info["name"]
+            print(
+                f"  Recover:   {color('gray', f'bgo logs {nm} --watcher   |   bgo restart {nm}')}"
+            )
+        else:
+            print(f"  Errored:   no")
+    wlog = watcher_log_path(info["name"])
+    if wlog.exists() and wlog.stat().st_size > 0:
+        print(f"  watcher:   {_human_size(wlog.stat().st_size)} ({wlog})")
+
 
 def _human_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -486,17 +986,22 @@ def cmd_logs(args):
         return 1
 
     # Determine which log to show
-    if getattr(args, "stderr", False):
+    show_watcher = getattr(args, "watcher", False)
+    if show_watcher:
+        stream = "watcher"
+        lf = watcher_log_path(name)
+    elif getattr(args, "stderr", False):
         stream = "err"
+        lf = log_path(name, stream)
     elif getattr(args, "stdout", False):
         stream = "out"
+        lf = log_path(name, stream)
     else:
         stream = "out"
-
-    lf = log_path(name, stream)
+        lf = log_path(name, stream)
 
     if not lf.exists() or lf.stat().st_size == 0:
-        label = "stderr" if stream == "err" else "stdout"
+        label = {"err": "stderr", "out": "stdout", "watcher": "watcher"}.get(stream, stream)
         print(f"No {label} logs found for '{name}'")
         if not getattr(args, "follow", False):
             return 0
@@ -508,9 +1013,13 @@ def cmd_logs(args):
         # Follow mode: use tail -f for reliability
         tail_args = ["tail", "-f", "-n", str(lines_to_show)]
 
-        # Show both streams if not explicitly filtered
+        # Show both streams if not explicitly filtered (only for stdout/stderr default)
         files = []
-        if not getattr(args, "stderr", False) and not getattr(args, "stdout", False):
+        if (
+            not show_watcher
+            and not getattr(args, "stderr", False)
+            and not getattr(args, "stdout", False)
+        ):
             err_log = log_path(name, "err")
             files.append(str(lf))
             if err_log.exists() and err_log.stat().st_size > 0:
@@ -903,15 +1412,45 @@ def cmd_delete(args):
 def main():
     init_dirs()
 
+    # Hidden subcommand for internal watcher loop
+    if len(sys.argv) >= 3 and sys.argv[1] == "__watcher__":
+        return cmd_watcher_loop(sys.argv[2])
+
     known_commands = {
         "start", "stop", "restart", "restart-stopped", "restart-last",
         "status", "logs", "clean", "delete", "resurrect",
+        "watch", "unwatch",
         "ls", "list", "follow", "tail", "-h", "--help",
     }
 
     # Direct mode: bgo <n> -- <cmd>   OR   bgo <cmd> [args...]
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands:
         remaining = sys.argv[1:]
+
+        # Strip -w / --watch in head (positions before '--', or first two positions if no '--').
+        want_watch = False
+        if "--" in remaining:
+            sep = remaining.index("--")
+            head, tail = remaining[:sep], remaining[sep:]
+            new_head = []
+            for tok in head:
+                if tok in ("-w", "--watch"):
+                    want_watch = True
+                else:
+                    new_head.append(tok)
+            remaining = new_head + tail
+        else:
+            new_remaining = []
+            for idx, tok in enumerate(remaining):
+                if idx < 2 and tok in ("-w", "--watch"):
+                    want_watch = True
+                    continue
+                new_remaining.append(tok)
+            remaining = new_remaining
+
+        if not remaining:
+            print("Usage: bgo <n> -- <command> [args...]")
+            return 1
 
         # Check if there's a '--' separator → explicit name mode
         if "--" in remaining:
@@ -920,26 +1459,27 @@ def main():
             command = remaining[sep_idx + 1 :]
 
             if not name or not command:
-                print("Usage: bgo <n> -- <command> [args...]")
+                print("Usage: bgo [-w] <n> -- <command> [args...]")
                 return 1
 
-            args = argparse.Namespace(name=name, command=command, cwd=None)
+            args = argparse.Namespace(
+                name=name, command=command, cwd=None, watch=want_watch,
+                interval=None, min_uptime=None, on_fast_crash=None,
+            )
             return cmd_start(args)
         else:
             # No '--' → heuristic: if first arg is NOT an executable but
             # second arg IS (or looks like a path/command), treat first as name.
-            # e.g. bgo myapp python3 server.py --port 8080
-            #      → name="myapp", command=["python3", "server.py", "--port", "8080"]
-            # Otherwise treat everything as the command with auto-derived name.
-            # e.g. bgo python3 server.py --port 8080
-            #      → name="python3", command=["python3", "server.py", "--port", "8080"]
             if len(remaining) >= 2 and not _looks_like_command(remaining[0]) and _looks_like_command(remaining[1]):
                 name = remaining[0]
                 command = remaining[1:]
             else:
                 command = remaining
                 name = derive_name(command)
-            args = argparse.Namespace(name=name, command=command, cwd=None)
+            args = argparse.Namespace(
+                name=name, command=command, cwd=None, watch=want_watch,
+                interval=None, min_uptime=None, on_fast_crash=None,
+            )
             return cmd_start(args)
 
     parser = argparse.ArgumentParser(
@@ -968,6 +1508,14 @@ Examples:
   bgo delete myapp                         # Remove from list + logs
   bgo clean                                # Remove all stopped entries
   bgo resurrect                            # Restart all previously running procs
+
+Watch mode (auto-restart on crash):
+  bgo start -w myapp -- python3 server.py  # Start with watcher
+  bgo -w myapp python3 server.py           # Direct mode with watcher
+  bgo watch myapp                          # Attach watcher to existing process
+  bgo watch myapp --interval 5 --min-uptime 3
+  bgo unwatch myapp                        # Detach watcher (keeps proc)
+  bgo logs myapp --watcher                 # View watcher events
         """,
     )
 
@@ -980,6 +1528,23 @@ Examples:
         "cmd", nargs=argparse.REMAINDER, help="Command to run (use -- before command)"
     )
     start_parser.add_argument("--cwd", help="Working directory for the process")
+    start_parser.add_argument(
+        "-w", "--watch", action="store_true",
+        help="Auto-restart this process if it crashes",
+    )
+    start_parser.add_argument(
+        "--interval", type=int, default=None,
+        help=f"Watch poll interval in seconds (default: {WATCH_DEFAULTS['interval']})",
+    )
+    start_parser.add_argument(
+        "--min-uptime", dest="min_uptime", type=int, default=None,
+        help=f"Crash threshold in seconds (default: {WATCH_DEFAULTS['min_uptime']})",
+    )
+    start_parser.add_argument(
+        "--on-fast-crash", dest="on_fast_crash",
+        choices=["backoff", "stop", "retry"], default=None,
+        help=f"Fast-crash policy (default: {WATCH_DEFAULTS['on_fast_crash']})",
+    )
 
     # stop
     stop_parser = subparsers.add_parser("stop", help="Stop a process")
@@ -991,6 +1556,35 @@ Examples:
     # restart
     restart_parser = subparsers.add_parser("restart", help="Restart a process")
     restart_parser.add_argument("name", help="Name of the process")
+
+    # watch
+    watch_parser = subparsers.add_parser(
+        "watch", help="Attach a watcher to an existing running process",
+    )
+    watch_parser.add_argument("name", help="Name of the process")
+    watch_parser.add_argument(
+        "--interval", type=int, default=None,
+        help=f"Poll interval in seconds (default: {WATCH_DEFAULTS['interval']})",
+    )
+    watch_parser.add_argument(
+        "--min-uptime", dest="min_uptime", type=int, default=None,
+        help=f"Crash threshold in seconds (default: {WATCH_DEFAULTS['min_uptime']})",
+    )
+    watch_parser.add_argument(
+        "--on-fast-crash", dest="on_fast_crash",
+        choices=["backoff", "stop", "retry"], default=None,
+        help=f"Fast-crash policy (default: {WATCH_DEFAULTS['on_fast_crash']})",
+    )
+    watch_parser.add_argument(
+        "--reset", action="store_true",
+        help="Reset watch config to defaults (ignore prior settings)",
+    )
+
+    # unwatch
+    unwatch_parser = subparsers.add_parser(
+        "unwatch", help="Detach watcher from a process (keeps proc running)",
+    )
+    unwatch_parser.add_argument("name", help="Name of the process")
 
     # restart-stopped
     rs_parser = subparsers.add_parser(
@@ -1033,6 +1627,10 @@ Examples:
     )
     logs_parser.add_argument("--stdout", action="store_true", help="Show only stdout")
     logs_parser.add_argument("--stderr", action="store_true", help="Show only stderr")
+    logs_parser.add_argument(
+        "--watcher", action="store_true",
+        help="Show the watcher log (restart events, errors)",
+    )
 
     # follow
     follow_parser = subparsers.add_parser(
@@ -1079,6 +1677,8 @@ Examples:
         "clean": cmd_clean,
         "resurrect": cmd_resurrect,
         "delete": cmd_delete,
+        "watch": cmd_watch,
+        "unwatch": cmd_unwatch,
     }
 
     handler = handlers.get(args.command)
