@@ -3,6 +3,12 @@
 Lightweight, zero-dep background process manager inspired by pm2.
 Detach any binary or script from your shell with one command.
 
+[![PyPI](https://img.shields.io/pypi/v/bgo-cli.svg)](https://pypi.org/project/bgo-cli/)
+[![Python](https://img.shields.io/pypi/pyversions/bgo-cli.svg)](https://pypi.org/project/bgo-cli/)
+[![License](https://img.shields.io/pypi/l/bgo-cli.svg)](LICENSE)
+
+PyPI: https://pypi.org/project/bgo-cli/
+
 ## Features
 
 - 🚀 **Simple syntax** — `bgo <name> -- <command>`
@@ -17,26 +23,51 @@ Detach any binary or script from your shell with one command.
 
 ## Installation
 
+### Recommended: `uv`
+
+[`uv`](https://docs.astral.sh/uv/) installs `bgo-cli` into an isolated
+environment and links the `bgo` command onto your PATH. No global
+Python pollution, no virtualenv to manage.
+
 ```bash
-# Via PyPI
-pip install bgo-cli
-# or
-pipx install bgo-cli
-# or
 uv tool install bgo-cli
+```
 
-# Via the install script (system-wide, needs sudo)
-./install.sh
+Upgrade:
+```bash
+uv tool upgrade bgo-cli
+```
 
-# User-local (~/.local/bin, no sudo)
-./install.sh --local
+Uninstall:
+```bash
+uv tool uninstall bgo-cli
+```
 
-# Or manually — bgo is a single file
-cp bgo ~/.local/bin/   # or /usr/local/bin/
+### Alternatives
+
+```bash
+# pipx (also isolated, very similar to uv tool)
+pipx install bgo-cli
+
+# Plain pip (installs into the active environment)
+pip install bgo-cli
+
+# Install script — builds nothing, just copies the single-file script
+./install.sh             # /usr/local/bin (sudo)
+./install.sh --local     # ~/.local/bin (no sudo)
+./install.sh --help      # --force / --uninstall
+
+# Or fully manual — bgo is a single file
+cp bgo ~/.local/bin/     # or /usr/local/bin/
 ln -s "$(pwd)/bgo" ~/.local/bin/bgo
 ```
 
-Run `./install.sh --help` for `--force` and `--uninstall` options.
+### Verify
+
+```bash
+bgo --help
+bgo ls          # no procs registered yet
+```
 
 ## Quick Start
 
