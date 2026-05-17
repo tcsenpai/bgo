@@ -1582,8 +1582,27 @@ def main():
     }
 
     # Direct mode: bgo <n> -- <cmd>   OR   bgo <cmd> [args...]
+    # Single-token invocation NEVER falls through to start — it routes to
+    # status detail if it names a registered proc, or prints help.
+    # Direct-mode start requires either an explicit '--' separator, a -w
+    # flag, OR at least 2 positional tokens (name + command).
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands:
         remaining = sys.argv[1:]
+
+        # Single arg → status detail if registered, else help
+        if len(remaining) == 1 and remaining[0] not in ("-w", "--watch"):
+            tok = remaining[0]
+            if tok.startswith("-"):
+                # Unknown flag — argparse handles it (prints error + usage)
+                pass
+            elif load_proc(tok) is not None:
+                args = argparse.Namespace(name=tok, watch=False, json=False, interval=None)
+                return cmd_status(args)
+            else:
+                print(f"{color('red', '❌')} Unknown command or process: '{tok}'")
+                print(f"   Run {color('bold', 'bgo --help')} for usage, or "
+                      f"{color('bold', 'bgo start ' + tok + ' -- <command>')} to start a new process.")
+                return 1
 
         # Strip -w / --watch in head (positions before '--', or first two positions if no '--').
         want_watch = False
