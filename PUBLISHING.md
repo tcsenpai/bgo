@@ -41,31 +41,33 @@ password (the token).
 ### Standard flow
 
 ```bash
-# 1. Bump the version in BOTH files (must match — publish.sh enforces).
-#    pyproject.toml :: [project] version
-#    src/bgo_cli/__init__.py :: __version__
-$EDITOR pyproject.toml src/bgo_cli/__init__.py
-
-# 2. Commit the bump
-git add pyproject.toml src/bgo_cli/__init__.py
-git commit -m "release: 0.2.1"
-git push origin main
-
-# 3. Run the publish script
+# Interactive — script prompts for the version bump
 ./publish.sh
+
+# Or non-interactive with an explicit bump
+./publish.sh --bump patch --yes      # 0.2.0 -> 0.2.1
+./publish.sh --bump minor --yes      # 0.2.0 -> 0.3.0
+./publish.sh --bump major --yes      # 0.2.0 -> 1.0.0
+./publish.sh --bump 0.5.0 --yes      # explicit X.Y.Z
+
+# Or skip the bump and release the current version as-is
+./publish.sh --current --yes
 ```
 
 `publish.sh` does (in order):
 1. Verify pyproject.toml and __init__.py versions match
-2. Verify working tree is clean (use `--allow-dirty` to override)
-3. Verify `v<version>` tag doesn't already exist
-4. Run pytest
-5. Clean `dist/` and run `python -m build`
-6. `twine check` both artifacts
-7. Confirm with you (skip with `--yes`)
-8. `twine upload`
-9. Smoke-test in a throwaway venv (skip with `--skip-smoke`)
-10. `git tag v<version> && git push origin v<version>` (skip with `--skip-tag`)
+2. **Bump the version** (interactive prompt: patch/minor/major/custom/current/quit, or via `--bump`/`--current`). Edits both files and commits `release: <new-version>`.
+3. Verify working tree is clean (use `--allow-dirty` to override)
+4. Verify `v<version>` tag doesn't already exist
+5. Run pytest
+6. Clean `dist/` and run `python -m build`
+7. `twine check` both artifacts
+8. Confirm with you (skip with `--yes`)
+9. `twine upload`
+10. Smoke-test in a throwaway venv (skip with `--skip-smoke`)
+11. `git tag v<version> && git push origin v<version>` (skip with `--skip-tag`)
+
+The script will refuse `--yes` without `--bump` or `--current` — explicit intent required for non-interactive runs.
 
 ### TestPyPI first (optional)
 
@@ -80,11 +82,14 @@ automatically.
 
 | Flag | Effect |
 |---|---|
+| `--bump patch\|minor\|major` | Semver bump |
+| `--bump X.Y.Z` | Explicit version |
+| `--current` | Don't bump, release current version |
 | `--test` | TestPyPI instead of PyPI; also implies `--skip-tag` |
 | `--skip-smoke` | Don't install + smoke-test after upload |
 | `--skip-tag` | Don't `git tag` + push |
 | `--allow-dirty` | Allow uncommitted changes (use with care) |
-| `--yes` / `-y` | Non-interactive — auto-confirm prompts |
+| `--yes` / `-y` | Non-interactive — auto-confirm prompts (requires `--bump` or `--current`) |
 
 ## Manual fallback (without the script)
 
