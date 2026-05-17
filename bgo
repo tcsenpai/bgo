@@ -99,7 +99,17 @@ def load_proc(name: str) -> dict | None:
 
 
 def save_proc(name: str, info: dict):
-    proc_file(name).write_text(json.dumps(info, indent=2))
+    """Atomic write: tmp file + os.replace.
+
+    Prevents torn JSON if the process is killed mid-write or if the
+    watcher and the foreground CLI both save concurrently. os.replace
+    is atomic on POSIX when src and dst are on the same filesystem,
+    which is guaranteed here (both under ~/.bgo/procs/).
+    """
+    pf = proc_file(name)
+    tmp = pf.with_suffix(pf.suffix + ".tmp")
+    tmp.write_text(json.dumps(info, indent=2))
+    os.replace(tmp, pf)
 
 
 def delete_proc(name: str):
