@@ -177,21 +177,44 @@ def is_running(pid: int | None) -> bool:
     return not _is_zombie(pid)
 
 
+_BLANK_PINFO = {"cpu": "-", "mem": "-", "time": "-"}
+
+
 def get_process_info(pid: int) -> dict:
-    """Get CPU/MEM/uptime via ps."""
+    """Get CPU/MEM/uptime for a single pid via ps. Prefer batch lookup."""
+    return get_process_info_batch([pid]).get(pid, dict(_BLANK_PINFO))
+
+
+def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
+    """Single ps call for many pids. Returns {pid: {cpu, mem, time}}."""
+    result_map: dict[int, dict] = {}
+    if not pids:
+        return result_map
+    # ps -p accepts comma-separated pids on both Linux and macOS.
+    pid_arg = ",".join(str(p) for p in pids)
     try:
         result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "%cpu,%mem,etime", "--no-headers"],
+            ["ps", "-p", pid_arg, "-o", "pid,%cpu,%mem,etime", "--no-headers"],
             capture_output=True,
             text=True,
+            timeout=4,
         )
         if result.returncode == 0:
-            parts = result.stdout.strip().split()
-            if len(parts) >= 3:
-                return {"cpu": parts[0], "mem": parts[1], "time": parts[2]}
-    except Exception:
+            for line in result.stdout.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) >= 4:
+                    try:
+                        result_map[int(parts[0])] = {
+                            "cpu": parts[1], "mem": parts[2], "time": parts[3],
+                        }
+                    except ValueError:
+                        continue
+    except (subprocess.SubprocessError, OSError):
         pass
-    return {"cpu": "-", "mem": "-", "time": "-"}
+    # Fill misses with blanks
+    for p in pids:
+        result_map.setdefault(p, dict(_BLANK_PINFO))
+    return result_map
 
 
 def _looks_like_command(arg: str) -> bool:
@@ -829,32 +852,59 @@ def _watch_cell(info: dict) -> str:
     return color("green", f"✓ {w.get('restarts', 0)}")
 
 
-def cmd_status(args):
-    """Show status of all processes."""
-    procs = load_all_procs()
+def _clear_screen():
+    """ANSI clear-screen + home cursor. TTY safe."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
 
-    if not procs:
-        print("No processes registered.")
-        print("Usage: bgo start <n> -- <command> [args...]")
-        print("       bgo <command> [args...]")
-        return 0
 
-    if getattr(args, "watch", False):
-        os.system("clear" if os.name != "nt" else "cls")
+def _status_snapshot(procs: dict) -> list[dict]:
+    """Build a status snapshot for procs. Returns list of dicts keyed by name.
 
-    # If a specific name is given, show detail view
-    if getattr(args, "name", None):
-        name = args.name
-        info = load_proc(name)
-        if not info:
-            print(f"{color('red', '❌')} No process named '{name}' found")
-            return 1
-        _print_proc_detail(info)
-        return 0
+    Pure: no printing. Side effect: persists status='stopped' for procs
+    whose pid is no longer running, so subsequent status calls stay
+    consistent. Batches the ps lookup into a single subprocess call.
+    """
+    running_pids = []
+    for info in procs.values():
+        pid = info.get("pid")
+        if is_running(pid):
+            running_pids.append(pid)
+    pinfo_map = get_process_info_batch(running_pids)
 
-    # Table view
+    rows = []
+    for name, info in sorted(procs.items()):
+        pid = info.get("pid")
+        running = is_running(pid)
+        if running:
+            pinfo = pinfo_map.get(pid, dict(_BLANK_PINFO))
+        else:
+            pinfo = dict(_BLANK_PINFO)
+            if info.get("status") != "stopped":
+                info["status"] = "stopped"
+                save_proc(name, info)
+        rows.append({
+            "name": name,
+            "pid": pid,
+            "status": "online" if running else "stopped",
+            "cpu": pinfo["cpu"],
+            "mem": pinfo["mem"],
+            "uptime": pinfo["time"],
+            "command": info.get("command", []),
+            "cwd": info.get("cwd"),
+            "started_at": info.get("started_at"),
+            "watch": info.get("watch"),
+        })
+    return rows
+
+
+def _print_status_table(rows: list[dict]):
+    """Render the status table for a snapshot."""
+    if not rows:
+        return
     term_width = shutil.get_terminal_size().columns
-    name_width = max(12, max(len(n) for n in procs.keys()) + 2)
+    name_width = max(12, max(len(r["name"]) for r in rows) + 2)
     watch_width = 12
     cmd_width = max(20, term_width - name_width - 55 - watch_width - 1)
 
@@ -875,26 +925,25 @@ def cmd_status(args):
     stopped_count = 0
     errored_procs = []
 
-    for name, info in sorted(procs.items()):
-        pid = info.get("pid")
-        cmd_str = " ".join(info.get("command", []))
-        cmd_str = truncate(cmd_str, cmd_width)
-        watch_str = _watch_cell(info)
-        w = info.get("watch") or {}
+    for r in rows:
+        cmd_str = truncate(" ".join(r["command"]), cmd_width)
+        # _watch_cell reads from info dict shape; reconstruct minimal info
+        watch_info = {"watch": r["watch"]}
+        watch_str = _watch_cell(watch_info)
+        w = r["watch"] or {}
         if w.get("errored"):
-            errored_procs.append((name, w.get("error_reason", "unknown")))
+            errored_procs.append((r["name"], w.get("error_reason", "unknown")))
 
-        if is_running(pid):
+        if r["status"] == "online":
             running_count += 1
-            proc_info = get_process_info(pid)
             status_str = color("green", "online")
             print(
-                f"{name:<{name_width}} "
+                f"{r['name']:<{name_width}} "
                 f"{status_str:<10} "
-                f"{color('gray', str(pid)):<8} "
-                f"{proc_info['cpu']:<7} "
-                f"{proc_info['mem']:<7} "
-                f"{proc_info['time']:<12} "
+                f"{color('gray', str(r['pid'])):<8} "
+                f"{r['cpu']:<7} "
+                f"{r['mem']:<7} "
+                f"{r['uptime']:<12} "
                 f"{watch_str:<{watch_width + 9}} "
                 f"{cmd_str}"
             )
@@ -902,7 +951,7 @@ def cmd_status(args):
             stopped_count += 1
             status_str = color("red", "stopped")
             print(
-                f"{name:<{name_width}} "
+                f"{r['name']:<{name_width}} "
                 f"{status_str:<10} "
                 f"{'-':<8} "
                 f"{'-':<7} "
@@ -911,13 +960,11 @@ def cmd_status(args):
                 f"{watch_str:<{watch_width + 9}} "
                 f"{color('gray', cmd_str)}"
             )
-            # Update status in state
-            info["status"] = "stopped"
-            save_proc(name, info)
 
     print(color("gray", "─" * term_width))
     print(
-        f"Total: {len(procs)} | {color('green', 'online')}: {running_count} | {color('red', 'stopped')}: {stopped_count}"
+        f"Total: {len(rows)} | {color('green', 'online')}: {running_count} | "
+        f"{color('red', 'stopped')}: {stopped_count}"
     )
     if errored_procs:
         print()
@@ -926,6 +973,64 @@ def cmd_status(args):
             print(f"   {color('red', n)} — {reason}")
             print(f"     {color('gray', f'bgo logs {n} --watcher   |   bgo restart {n}')}")
 
+
+def cmd_status(args):
+    """Show status of all processes."""
+    # JSON output mode bypasses everything else
+    if getattr(args, "json", False):
+        procs = load_all_procs()
+        if getattr(args, "name", None):
+            info = load_proc(args.name)
+            if not info:
+                print(json.dumps({"error": f"no process named '{args.name}'"}))
+                return 1
+            rows = _status_snapshot({args.name: info})
+            print(json.dumps(rows[0], indent=2, default=str))
+            return 0
+        rows = _status_snapshot(procs)
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+
+    # Watch mode: refresh until Ctrl-C
+    if getattr(args, "watch", False):
+        interval = max(1, getattr(args, "interval", None) or 2)
+        try:
+            while True:
+                _clear_screen()
+                procs = load_all_procs()
+                if not procs:
+                    print("No processes registered.")
+                    print("Usage: bgo start <n> -- <command> [args...]")
+                else:
+                    rows = _status_snapshot(procs)
+                    _print_status_table(rows)
+                    print(color("gray", f"\nRefreshing every {interval}s. Ctrl-C to exit."))
+                try:
+                    time.sleep(interval)
+                except KeyboardInterrupt:
+                    return 0
+        except KeyboardInterrupt:
+            return 0
+
+    # Default: one-shot table or detail view
+    procs = load_all_procs()
+    if not procs:
+        print("No processes registered.")
+        print("Usage: bgo start <n> -- <command> [args...]")
+        print("       bgo <command> [args...]")
+        return 0
+
+    if getattr(args, "name", None):
+        name = args.name
+        info = load_proc(name)
+        if not info:
+            print(f"{color('red', '❌')} No process named '{name}' found")
+            return 1
+        _print_proc_detail(info)
+        return 0
+
+    rows = _status_snapshot(procs)
+    _print_status_table(rows)
     return 0
 
 
@@ -1653,6 +1758,14 @@ Watch mode (auto-restart on crash):
     )
     status_parser.add_argument(
         "-w", "--watch", action="store_true", help="Watch mode (auto-refresh)"
+    )
+    status_parser.add_argument(
+        "--interval", type=int, default=None,
+        help="Refresh interval in seconds for --watch (default: 2)",
+    )
+    status_parser.add_argument(
+        "--json", action="store_true",
+        help="Output as JSON (machine-readable, no colors)",
     )
 
     # logs
