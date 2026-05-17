@@ -112,9 +112,11 @@ def save_proc(name: str, info: dict):
     os.replace(tmp, pf)
 
 
-def delete_proc(name: str):
-    """Remove proc file and logs."""
+def delete_proc(name: str, keep_logs: bool = False):
+    """Remove proc state file. Logs removed unless keep_logs=True."""
     proc_file(name).unlink(missing_ok=True)
+    if keep_logs:
+        return
     for stream in ("out", "err"):
         log_path(name, stream).unlink(missing_ok=True)
     watcher_log_path(name).unlink(missing_ok=True)
@@ -1411,8 +1413,10 @@ def cmd_delete(args):
                 return 0
         kill_process(pid, info.get("pgid"))
 
-    delete_proc(name)
-    print(f"🗑️  Deleted '{name}'")
+    keep_logs = getattr(args, "keep_logs", False)
+    delete_proc(name, keep_logs=keep_logs)
+    suffix = " (logs kept)" if keep_logs else ""
+    print(f"🗑️  Deleted '{name}'{suffix}")
     return 0
 
 
@@ -1674,6 +1678,10 @@ Watch mode (auto-restart on crash):
     delete_parser.add_argument("name", help="Name of the process")
     delete_parser.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation"
+    )
+    delete_parser.add_argument(
+        "--keep-logs", dest="keep_logs", action="store_true",
+        help="Preserve out/err/watcher log files after delete",
     )
 
     args = parser.parse_args()
