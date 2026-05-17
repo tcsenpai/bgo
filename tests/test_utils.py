@@ -107,6 +107,60 @@ def test_default_watch_config_rejects_unknown_keys(bgo):
     assert "bogus_key" not in cfg
 
 
+# --- _resolve_watch_block ---
+
+def test_resolve_watch_want_fresh(bgo):
+    """want_watch=True with no prior -> fresh defaults."""
+    block = bgo._resolve_watch_block(True, None, None)
+    assert block is not None
+    assert block["enabled"] is True
+    assert block["restarts"] == 0
+
+
+def test_resolve_watch_want_overrides_prior(bgo):
+    """Explicit -w wins over prior; counters reset."""
+    prior = bgo._default_watch_config()
+    prior["restarts"] = 42
+    block = bgo._resolve_watch_block(True, {"interval": 10}, prior)
+    assert block["interval"] == 10
+    assert block["restarts"] == 0  # fresh defaults
+
+
+def test_resolve_watch_inherit_prior(bgo):
+    """No -w but prior watch enabled -> carry forward, preserve counters."""
+    prior = bgo._default_watch_config({"interval": 7})
+    prior["restarts"] = 42
+    prior["watcher_pid"] = 1234
+    prior["errored"] = True
+    prior["error_reason"] = "boom"
+    block = bgo._resolve_watch_block(False, None, prior)
+    assert block is not None
+    assert block["interval"] == 7
+    assert block["restarts"] == 42  # preserved
+    assert block["watcher_pid"] is None  # runtime cleared
+    assert block["errored"] is False  # runtime cleared
+    assert block["error_reason"] is None
+
+
+def test_resolve_watch_no_prior_no_want(bgo):
+    """No -w and no prior -> None."""
+    assert bgo._resolve_watch_block(False, None, None) is None
+
+
+def test_resolve_watch_disabled_prior_returns_none(bgo):
+    """Prior watch with enabled=False is treated as no prior."""
+    prior = bgo._default_watch_config()
+    prior["enabled"] = False
+    assert bgo._resolve_watch_block(False, None, prior) is None
+
+
+def test_resolve_watch_returns_new_dict(bgo):
+    """Result should not be the same object as prior — caller mutates it."""
+    prior = bgo._default_watch_config()
+    block = bgo._resolve_watch_block(False, None, prior)
+    assert block is not prior
+
+
 # --- _tail_stderr ---
 
 def test_tail_stderr_missing_file(bgo):

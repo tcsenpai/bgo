@@ -294,6 +294,35 @@ BACKOFF_SCHEDULE = [2, 4, 8]
 TAIL_BYTES = 2048
 
 
+def _resolve_watch_block(
+    want_watch: bool,
+    overrides: dict | None,
+    prior_watch: dict | None,
+) -> dict | None:
+    """Decide what watch block a (re)starting proc should have.
+
+    Three paths, in priority order:
+      1. want_watch=True  -> fresh default block, optionally with overrides
+      2. prior_watch enabled (internal restart path) -> carry forward,
+         clear runtime fields (watcher_pid, errored, error_reason,
+         last_stderr_tail) but PRESERVE restart counters
+      3. otherwise -> None (no watch)
+
+    Pure: no side effects. Returns a new dict in all non-None cases.
+    """
+    if want_watch:
+        return _default_watch_config(overrides)
+    if prior_watch and prior_watch.get("enabled"):
+        carried = dict(prior_watch)
+        carried["watcher_pid"] = None
+        carried["watcher_pgid"] = None
+        carried["errored"] = False
+        carried["error_reason"] = None
+        carried["last_stderr_tail"] = None
+        return carried
+    return None
+
+
 def _default_watch_config(overrides: dict | None = None) -> dict:
     """Build a fresh watch config block with defaults."""
     cfg = {
@@ -630,28 +659,16 @@ def cmd_start(args):
     except OSError:
         pgid = None
 
-    # Preserve prior watch config if restart, otherwise build from args/existing
     prior_watch = (existing or {}).get("watch") if existing else None
-    want_watch = getattr(args, "watch", False)
-    watch_overrides = {
-        "interval": getattr(args, "interval", None),
-        "min_uptime": getattr(args, "min_uptime", None),
-        "on_fast_crash": getattr(args, "on_fast_crash", None),
-    }
-
-    if want_watch:
-        watch_block = _default_watch_config(watch_overrides)
-        # Carry forward restart counters? No — fresh start resets.
-    elif prior_watch and prior_watch.get("enabled"):
-        # Internal restart path (cmd_restart/_restart_one) preserves watch
-        watch_block = dict(prior_watch)
-        watch_block["watcher_pid"] = None
-        watch_block["watcher_pgid"] = None
-        watch_block["errored"] = False
-        watch_block["error_reason"] = None
-        watch_block["last_stderr_tail"] = None
-    else:
-        watch_block = None
+    watch_block = _resolve_watch_block(
+        want_watch=getattr(args, "watch", False),
+        overrides={
+            "interval": getattr(args, "interval", None),
+            "min_uptime": getattr(args, "min_uptime", None),
+            "on_fast_crash": getattr(args, "on_fast_crash", None),
+        },
+        prior_watch=prior_watch,
+    )
 
     info = {
         "name": name,
