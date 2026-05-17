@@ -80,8 +80,6 @@ include = [
     "/tests",
     "/README.md",
     "/LICENSE",
-    "/AGENTS.md",
-    "/TEAM.md",
     "/pyproject.toml",
 ]
 exclude = [

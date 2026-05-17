@@ -1,3 +1,7 @@
+# Agent / dev-context files (kept locally, not shipped)
+AGENTS.md
+TEAM.md
+
 # Hindsight memory bank pointer (local)
 .bank
 
