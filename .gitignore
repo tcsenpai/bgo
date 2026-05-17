@@ -15,3 +15,15 @@ PROJECT_INDEX.md
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+src/*.egg-info/
+
+# Local virtualenvs
+.venv/
+venv/
+.env

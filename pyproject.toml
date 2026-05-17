@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bgo-cli"
+version = "0.2.0"
+description = "Lightweight, zero-dependency background process manager (pm2-style) with watch mode and auto-restart."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "tcsenpai", email = "tcsenpai@discus.sh" },
+]
+keywords = [
+    "process-manager",
+    "pm2",
+    "background",
+    "supervisor",
+    "watchdog",
+    "cli",
+    "daemon",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[project.scripts]
+bgo = "bgo_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tcsenpai/bgo"
+Repository = "https://github.com/tcsenpai/bgo"
+Issues = "https://github.com/tcsenpai/bgo/issues"
+Changelog = "https://github.com/tcsenpai/bgo/commits/main"
+
+# --- Build configuration ---
+
+[tool.hatch.build.targets.wheel]
+# Standard src layout — package lives in src/bgo_cli/
+packages = ["src/bgo_cli"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Pull the root single-file `bgo` script into the wheel as
+# bgo_cli/_core.py so the package is self-contained at install time.
+# The package's __init__.py prefers this packaged copy over the
+# repo-root path during runtime resolution.
+"bgo" = "src/bgo_cli/_core.py"
+
+[tool.hatch.build.targets.sdist]
+# Source distribution includes the root bgo script, the package, tests,
+# install.sh, and metadata files.
+include = [
+    "/bgo",
+    "/install.sh",
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/AGENTS.md",
+    "/TEAM.md",
+    "/pyproject.toml",
+]
+exclude = [
+    ".git*",
+    ".bank",
+    ".mycelium/",
+    ".serena/",
+    ".pytest_cache/",
+    "__pycache__/",
+    "PROJECT_INDEX.*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

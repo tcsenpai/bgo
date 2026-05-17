@@ -18,13 +18,20 @@ Detach any binary or script from your shell with one command.
 ## Installation
 
 ```bash
-# System-wide (sudo)
+# Via PyPI
+pip install bgo-cli
+# or
+pipx install bgo-cli
+# or
+uv tool install bgo-cli
+
+# Via the install script (system-wide, needs sudo)
 ./install.sh
 
 # User-local (~/.local/bin, no sudo)
 ./install.sh --local
 
-# Or manually
+# Or manually — bgo is a single file
 cp bgo ~/.local/bin/   # or /usr/local/bin/
 ln -s "$(pwd)/bgo" ~/.local/bin/bgo
 ```
