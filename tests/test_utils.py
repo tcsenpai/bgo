@@ -63,6 +63,16 @@ def test_is_running_nonexistent(bgo):
     assert bgo.is_running(999999) is False
 
 
+def test_is_zombie_self_is_false(bgo):
+    """Our own running test process is not a zombie."""
+    assert bgo._is_zombie(os.getpid()) is False
+
+
+def test_is_zombie_nonexistent_pid_is_false(bgo):
+    """Non-existent PID returns False (not a zombie, not running)."""
+    assert bgo._is_zombie(999999) is False
+
+
 # --- _default_watch_config ---
 
 def test_default_watch_config_no_overrides(bgo):

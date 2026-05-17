@@ -137,6 +137,35 @@ def load_all_procs() -> dict[str, dict]:
 # --- Utilities ---
 
 
+def _is_zombie(pid: int) -> bool:
+    """Return True if pid is a zombie/defunct process. Platform-aware."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat = f.read()
+            # stat format: pid (comm) state ...  comm may contain spaces/parens.
+            rparen = stat.rfind(")")
+            if rparen != -1:
+                state = stat[rparen + 2 : rparen + 3]
+                return state == "Z"
+        except (OSError, IndexError):
+            return False
+        return False
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat=", ],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0:
+                state = result.stdout.strip()
+                # macOS ps stat: 'Z' is zombie; may be prefixed with flags
+                return state.startswith("Z")
+        except (subprocess.SubprocessError, OSError):
+            return False
+    return False
+
+
 def is_running(pid: int | None) -> bool:
     """Return True if pid is alive AND not a zombie/defunct process."""
     if pid is None:
@@ -145,19 +174,7 @@ def is_running(pid: int | None) -> bool:
         os.kill(pid, 0)
     except (ProcessLookupError, OSError):
         return False
-    # On Linux, filter out zombies via /proc/<pid>/stat (state 'Z')
-    try:
-        with open(f"/proc/{pid}/stat", "r") as f:
-            stat = f.read()
-        # stat format: pid (comm) state ...  comm may contain spaces/parens.
-        rparen = stat.rfind(")")
-        if rparen != -1:
-            state = stat[rparen + 2 : rparen + 3]
-            if state == "Z":
-                return False
-    except (OSError, IndexError):
-        pass  # non-Linux or transient — assume alive based on kill check
-    return True
+    return not _is_zombie(pid)
 
 
 def get_process_info(pid: int) -> dict:
