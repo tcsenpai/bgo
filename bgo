@@ -57,6 +57,90 @@ def truncate(s: str, width: int) -> str:
     return s
 
 
+# --- Terminal capability detection ---
+
+# Three levels:
+#   plain  — no color, ASCII-only dashes, no glyphs (CI logs, dumb terms,
+#            non-TTY pipes)
+#   normal — ANSI color + ASCII dashes (default for color-capable TTYs)
+#   fancy  — ANSI color + Unicode box-drawing + heavier visual structure
+#            (UTF-8-capable TTYs)
+LEVEL_PLAIN = "plain"
+LEVEL_NORMAL = "normal"
+LEVEL_FANCY = "fancy"
+
+
+def _detect_table_level(force: str | None = None) -> str:
+    """Decide which rendering level to use.
+
+    Resolution order:
+      1. explicit `force` (from --plain/--fancy or BGO_TABLE env)
+      2. non-TTY stdout         -> plain
+      3. TERM=dumb              -> plain
+      4. LANG/LC_* lacks UTF-8  -> normal
+      5. otherwise              -> fancy
+    """
+    if force in (LEVEL_PLAIN, LEVEL_NORMAL, LEVEL_FANCY):
+        return force
+    env_force = os.environ.get("BGO_TABLE", "").strip().lower()
+    if env_force in (LEVEL_PLAIN, LEVEL_NORMAL, LEVEL_FANCY):
+        return env_force
+    if not sys.stdout.isatty():
+        return LEVEL_PLAIN
+    if os.environ.get("TERM", "") == "dumb":
+        return LEVEL_PLAIN
+    lc = (
+        os.environ.get("LC_ALL")
+        or os.environ.get("LC_CTYPE")
+        or os.environ.get("LANG")
+        or ""
+    ).upper()
+    if "UTF-8" not in lc and "UTF8" not in lc:
+        return LEVEL_NORMAL
+    return LEVEL_FANCY
+
+
+# Glyph set per level. Keys must be identical across levels so callers
+# can index without branching.
+GLYPHS = {
+    LEVEL_PLAIN: {
+        "hline": "-", "vline": "|", "cross": "+",
+        "tl": "+", "tr": "+", "bl": "+", "br": "+",
+        "tdown": "+", "tup": "+", "tleft": "+", "tright": "+",
+        "online": "ON", "stopped": "OFF",
+        "watching": "[W]", "errored": "[!]", "watcher_dead": "[?]",
+        "watch_none": "-",
+        "ok": "OK", "fail": "FAIL", "warn": "WARN",
+        "tombstone": "[X]", "rocket": "[+]", "eye": "[W]",
+    },
+    LEVEL_NORMAL: {
+        "hline": "─", "vline": "│", "cross": "┼",
+        "tl": "┌", "tr": "┐", "bl": "└", "br": "┘",
+        "tdown": "┬", "tup": "┴", "tleft": "┤", "tright": "├",
+        "online": "online", "stopped": "stopped",
+        "watching": "✓", "errored": "⚠", "watcher_dead": "!",
+        "watch_none": "-",
+        "ok": "✅", "fail": "❌", "warn": "⚠️",
+        "tombstone": "🗑️", "rocket": "🚀", "eye": "👁",
+    },
+    LEVEL_FANCY: {
+        "hline": "━", "vline": "┃", "cross": "╋",
+        "tl": "┏", "tr": "┓", "bl": "┗", "br": "┛",
+        "tdown": "┳", "tup": "┻", "tleft": "┫", "tright": "┣",
+        "online": "● online", "stopped": "○ stopped",
+        "watching": "✓", "errored": "⚠", "watcher_dead": "!",
+        "watch_none": "·",
+        "ok": "✅", "fail": "❌", "warn": "⚠️",
+        "tombstone": "🗑️", "rocket": "🚀", "eye": "👁",
+    },
+}
+
+
+def glyphs(level: str | None = None) -> dict:
+    """Return the glyph set for a level (default: auto-detect)."""
+    return GLYPHS[level or _detect_table_level()]
+
+
 def init_dirs():
     """Initialize required directories."""
     PROCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -860,17 +944,18 @@ def cmd_unwatch(args):
     return 0
 
 
-def _watch_cell(info: dict) -> str:
+def _watch_cell(info: dict, level: str | None = None) -> str:
     """Render the WATCH column cell for the status table."""
+    g = glyphs(level)
     w = info.get("watch")
     if not w or not w.get("enabled"):
-        return "-"
+        return g["watch_none"]
     if w.get("errored"):
-        return color("red", "⚠ errored")
+        return color("red", f"{g['errored']} errored")
     wpid = w.get("watcher_pid")
     if wpid and not is_running(wpid):
-        return color("yellow", "! dead")
-    return color("green", f"✓ {w.get('restarts', 0)}")
+        return color("yellow", f"{g['watcher_dead']} dead")
+    return color("green", f"{g['watching']} {w.get('restarts', 0)}")
 
 
 def _clear_screen():
@@ -920,79 +1005,126 @@ def _status_snapshot(procs: dict) -> list[dict]:
     return rows
 
 
-def _print_status_table(rows: list[dict]):
+def _visible_width(s: str) -> int:
+    """Visible length of a string (ANSI codes stripped)."""
+    return len(strip_ansi(s))
+
+
+def _pad(text: str, width: int, align: str = "left") -> str:
+    """Pad `text` to visible width using spaces. ANSI-safe."""
+    pad = max(0, width - _visible_width(text))
+    if align == "right":
+        return " " * pad + text
+    return text + " " * pad
+
+
+def _print_status_table(rows: list[dict], level: str | None = None):
     """Render the status table for a snapshot."""
     if not rows:
         return
+    level = level or _detect_table_level()
+    g = GLYPHS[level]
     term_width = shutil.get_terminal_size().columns
-    name_width = max(12, max(len(r["name"]) for r in rows) + 2)
-    watch_width = 12
-    cmd_width = max(20, term_width - name_width - 55 - watch_width - 1)
 
-    header = (
-        f"{color('bold', 'NAME'):<{name_width}} "
-        f"{color('bold', 'STATUS'):<10} "
-        f"{color('bold', 'PID'):<8} "
-        f"{color('bold', 'CPU'):<7} "
-        f"{color('bold', 'MEM'):<7} "
-        f"{color('bold', 'UPTIME'):<12} "
-        f"{color('bold', 'WATCH'):<{watch_width + 9}} "  # +9 for ANSI overhead in cells
-        f"{color('bold', 'COMMAND')}"
-    )
-    print(header)
-    print(color("gray", "─" * term_width))
+    # column widths (visible chars only)
+    name_w = max(12, max(len(r["name"]) for r in rows) + 1)
+    status_w = max(len(g["online"]), len(g["stopped"])) + 1
+    pid_w = 8
+    cpu_w = 6
+    mem_w = 6
+    uptime_w = 12
+    watch_w = 12
+
+    fixed = name_w + status_w + pid_w + cpu_w + mem_w + uptime_w + watch_w
+    # column separators: plain/normal use spaces; fancy uses vertical bars
+    sep_w = 7  # 7 inter-column gaps
+    cmd_w = max(20, term_width - fixed - sep_w - 2)
+
+    # --- header ---
+    headers = ["NAME", "STATUS", "PID", "CPU", "MEM", "UPTIME", "WATCH", "COMMAND"]
+    widths = [name_w, status_w, pid_w, cpu_w, mem_w, uptime_w, watch_w, cmd_w]
+    if level == LEVEL_FANCY:
+        rule = g["hline"] * (sum(widths) + sep_w + 2)
+        top = g["tl"] + rule[1:-1] + g["tr"]
+        bottom = g["bl"] + rule[1:-1] + g["br"]
+        mid_rule = g["hline"] * (sum(widths) + sep_w + 2)
+        print(color("gray", top))
+        cells = [color("bold", _pad(h, w)) for h, w in zip(headers, widths)]
+        print(g["vline"] + " " + (" ").join(cells) + " " + g["vline"])
+        print(color("gray", g["tright"] + mid_rule[1:-1] + g["tleft"]))
+    else:
+        cells = [color("bold", _pad(h, w)) for h, w in zip(headers, widths)]
+        print(" ".join(cells))
+        print(color("gray", g["hline"] * min(term_width, sum(widths) + sep_w)))
 
     running_count = 0
     stopped_count = 0
     errored_procs = []
 
     for r in rows:
-        cmd_str = truncate(" ".join(r["command"]), cmd_width)
-        # _watch_cell reads from info dict shape; reconstruct minimal info
-        watch_info = {"watch": r["watch"]}
-        watch_str = _watch_cell(watch_info)
+        cmd_str = truncate(" ".join(r["command"]), cmd_w)
+        watch_str = _watch_cell({"watch": r["watch"]}, level)
         w = r["watch"] or {}
         if w.get("errored"):
             errored_procs.append((r["name"], w.get("error_reason", "unknown")))
 
         if r["status"] == "online":
             running_count += 1
-            status_str = color("green", "online")
-            print(
-                f"{r['name']:<{name_width}} "
-                f"{status_str:<10} "
-                f"{color('gray', str(r['pid'])):<8} "
-                f"{r['cpu']:<7} "
-                f"{r['mem']:<7} "
-                f"{r['uptime']:<12} "
-                f"{watch_str:<{watch_width + 9}} "
-                f"{cmd_str}"
-            )
+            status_str = color("green", g["online"])
+            cells = [
+                _pad(r["name"], name_w),
+                _pad(status_str, status_w),
+                _pad(color("gray", str(r["pid"])), pid_w),
+                _pad(str(r["cpu"]), cpu_w),
+                _pad(str(r["mem"]), mem_w),
+                _pad(str(r["uptime"]), uptime_w),
+                _pad(watch_str, watch_w),
+                cmd_str,
+            ]
         else:
             stopped_count += 1
-            status_str = color("red", "stopped")
-            print(
-                f"{r['name']:<{name_width}} "
-                f"{status_str:<10} "
-                f"{'-':<8} "
-                f"{'-':<7} "
-                f"{'-':<7} "
-                f"{'-':<12} "
-                f"{watch_str:<{watch_width + 9}} "
-                f"{color('gray', cmd_str)}"
-            )
+            status_str = color("red", g["stopped"])
+            cells = [
+                _pad(r["name"], name_w),
+                _pad(status_str, status_w),
+                _pad("-", pid_w),
+                _pad("-", cpu_w),
+                _pad("-", mem_w),
+                _pad("-", uptime_w),
+                _pad(watch_str, watch_w),
+                color("gray", cmd_str),
+            ]
 
-    print(color("gray", "─" * term_width))
-    print(
-        f"Total: {len(rows)} | {color('green', 'online')}: {running_count} | "
-        f"{color('red', 'stopped')}: {stopped_count}"
+        if level == LEVEL_FANCY:
+            print(g["vline"] + " " + " ".join(cells) + " " + g["vline"])
+        else:
+            print(" ".join(cells))
+
+    if level == LEVEL_FANCY:
+        print(color("gray", bottom))
+    else:
+        print(color("gray", g["hline"] * min(term_width, sum(widths) + sep_w)))
+
+    summary = (
+        f"Total: {len(rows)} | {color('green', g['online'])}: {running_count} | "
+        f"{color('red', g['stopped'])}: {stopped_count}"
     )
+    print(summary)
     if errored_procs:
         print()
-        print(color("red", f"⚠ {len(errored_procs)} errored:"))
+        print(color("red", f"{g['errored']} {len(errored_procs)} errored:"))
         for n, reason in errored_procs:
             print(f"   {color('red', n)} — {reason}")
             print(f"     {color('gray', f'bgo logs {n} --watcher   |   bgo restart {n}')}")
+
+
+def _level_from_args(args) -> str | None:
+    """Resolve --plain / --fancy CLI flags into a level string, or None for auto."""
+    if getattr(args, "plain", False):
+        return LEVEL_PLAIN
+    if getattr(args, "fancy", False):
+        return LEVEL_FANCY
+    return None
 
 
 def cmd_status(args):
@@ -1012,6 +1144,8 @@ def cmd_status(args):
         print(json.dumps(rows, indent=2, default=str))
         return 0
 
+    level_override = _level_from_args(args)
+
     # Watch mode: refresh until Ctrl-C
     if getattr(args, "watch", False):
         interval = max(1, getattr(args, "interval", None) or 2)
@@ -1024,7 +1158,7 @@ def cmd_status(args):
                     print("Usage: bgo start <n> -- <command> [args...]")
                 else:
                     rows = _status_snapshot(procs)
-                    _print_status_table(rows)
+                    _print_status_table(rows, level=level_override)
                     print(color("gray", f"\nRefreshing every {interval}s. Ctrl-C to exit."))
                 try:
                     time.sleep(interval)
@@ -1051,7 +1185,7 @@ def cmd_status(args):
         return 0
 
     rows = _status_snapshot(procs)
-    _print_status_table(rows)
+    _print_status_table(rows, level=level_override)
     return 0
 
 
@@ -1810,6 +1944,15 @@ Watch mode (auto-restart on crash):
     status_parser.add_argument(
         "--json", action="store_true",
         help="Output as JSON (machine-readable, no colors)",
+    )
+    status_level_group = status_parser.add_mutually_exclusive_group()
+    status_level_group.add_argument(
+        "--plain", action="store_true",
+        help="Force plain rendering (no color, ASCII only)",
+    )
+    status_level_group.add_argument(
+        "--fancy", action="store_true",
+        help="Force fancy rendering (Unicode box-drawing)",
     )
 
     # logs
