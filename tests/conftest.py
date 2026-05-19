@@ -30,15 +30,29 @@ def _load_bgo():
 
 @pytest.fixture
 def bgo(monkeypatch, tmp_path):
-    """Fresh bgo module with sandboxed ~/.bgo pointing into tmp_path."""
+    """Fresh bgo module with sandboxed ~/.bgo pointing into tmp_path.
+
+    State paths now live in ``bgo_cli._state`` (post-modularization).
+    Patching both the script module *and* the state module keeps tests
+    that read either path consistent.
+    """
     sandbox = tmp_path / "bgo_home"
     sandbox.mkdir()
     monkeypatch.setenv("HOME", str(sandbox))
     if "bgo_mod" in sys.modules:
         del sys.modules["bgo_mod"]
     mod = _load_bgo()
-    mod.BGO_DIR = sandbox / ".bgo"
-    mod.PROCS_DIR = mod.BGO_DIR / "procs"
-    mod.LOGS_DIR = mod.BGO_DIR / "logs"
+    bgo_dir = sandbox / ".bgo"
+    procs_dir = bgo_dir / "procs"
+    logs_dir = bgo_dir / "logs"
+    # Patch both the script's re-exported names AND the source module
+    # so any code path that resolves via either binding sees the same
+    # sandbox.
+    for target in (mod, sys.modules.get("bgo_cli._state")):
+        if target is None:
+            continue
+        target.BGO_DIR = bgo_dir
+        target.PROCS_DIR = procs_dir
+        target.LOGS_DIR = logs_dir
     mod.init_dirs()
     return mod
