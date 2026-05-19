@@ -424,6 +424,8 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
     else in the module is framework-agnostic and unit-tested without
     Qt installed.
     """
+    import signal
+
     try:
         from PySide6.QtCore import QByteArray, QTimer
         from PySide6.QtGui import QAction, QIcon, QPixmap
@@ -586,6 +588,21 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
     timer.timeout.connect(rebuild)
     timer.start()
     held.append(timer)
+
+    # SIGINT (Ctrl+C) handling. Qt's C++ event loop blocks in select()
+    # and never returns to the Python interpreter, so a plain
+    # signal.signal() handler would never fire. Two fixes together:
+    # 1. Restore the default Python SIGINT handler that calls app.quit
+    #    via Qt's signal-safe path.
+    # 2. Run a no-op QTimer every 200ms so the interpreter wakes up
+    #    often enough to deliver pending signals to Python handlers.
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    sigwake = QTimer()
+    sigwake.setInterval(200)
+    sigwake.timeout.connect(lambda: None)
+    sigwake.start()
+    held.append(sigwake)
 
     return int(app.exec())
 
