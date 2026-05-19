@@ -103,6 +103,20 @@ def test_status_label_matrix(status: str, errored: bool, expected: str) -> None:
     assert _tray._status_label(snap) == expected
 
 
+@pytest.mark.parametrize(
+    ("status", "errored", "expected_glyph"),
+    [
+        ("running", False, "●"),
+        ("running", True, "⚠"),
+        ("stopped", False, "○"),
+    ],
+)
+def test_status_glyph_matrix(status: str, errored: bool, expected_glyph: str) -> None:
+    """Each status maps to a distinct Unicode glyph for the menu."""
+    snap = _tray.ProcSnapshot("x", status, 1, errored=errored)
+    assert _tray._status_glyph(snap) == expected_glyph
+
+
 # --- _poll_interval -----------------------------------------------------
 
 

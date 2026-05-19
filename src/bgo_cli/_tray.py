@@ -120,6 +120,22 @@ def _status_label(snap: ProcSnapshot) -> str:
     return "stopped"
 
 
+# Unicode glyphs paired with status keys. QAction labels render
+# Unicode reliably across KDE, GNOME, and macOS — the only way to get
+# "color" in menu items without per-platform theming code is to use
+# glyphs whose shape (filled vs hollow vs warning) communicates state.
+_STATUS_GLYPHS: dict[str, str] = {
+    "online":  "●",   # filled circle  — running
+    "stopped": "○",   # hollow circle  — stopped
+    "errored": "⚠",   # warning sign   — errored
+}
+
+
+def _status_glyph(snap: ProcSnapshot) -> str:
+    """Return the Unicode glyph for the snap's status."""
+    return _STATUS_GLYPHS[_status_label(snap)]
+
+
 def build_menu_spec(snapshots: Iterable[ProcSnapshot]) -> MenuSpec:
     """Render snapshots into a :class:`MenuSpec` for the toolkit layer.
 
@@ -321,26 +337,47 @@ _DOT_COLORS: dict[str, str] = {
 def _icon_svg(dot_color: str) -> bytes:
     """Render the gear+dot SVG with the given dot color.
 
-    The gear silhouette is a 12-tooth cog drawn with `path` data so it
-    scales crisply down to 16px. The center dot is a circle so it
-    renders solid even at the smallest size.
+    Composition strategy avoids the ``fill-rule=evenodd`` cutout that
+    some renderers (notably Qt's QSvgRenderer + KDE Plasma's monochrome
+    SNI repaint pass) mishandle:
+
+    1. **Ring** — a thick stroked circle = the gear body.
+    2. **Teeth** — 12 small rectangles placed radially around the ring.
+    3. **Dot**  — colored circle in the middle, sitting on top.
+
+    Each is a separate SVG element. Total: 14 shapes, all explicitly
+    filled, no path subtraction. Renders identically on Qt, KDE
+    monochrome repaint, and macOS Cocoa.
     """
+    # 12 teeth at 30° intervals. Each tooth = 6×8 rect centered on a
+    # radial line at radius 26 from center (32, 32).
+    import math
+
+    teeth = []
+    for i in range(12):
+        angle = math.radians(i * 30)
+        # Place tooth so its base touches the outer edge of the ring.
+        cx = 32 + math.cos(angle) * 28
+        cy = 32 + math.sin(angle) * 28
+        # Rotate the rect to align with the radial direction.
+        deg = i * 30
+        teeth.append(
+            f'<rect x="-3" y="-4" width="6" height="8" rx="1.2" '
+            f'fill="#ffffff" '
+            f'transform="translate({cx:.2f} {cy:.2f}) rotate({deg})"/>'
+        )
+
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-        # 12-tooth gear outline — symmetric, balanced visual weight.
-        '<path fill="#ffffff" d="'
-        'M32 4 L36 4 L37 11 L42 13 L47 9 L51 13 L47 17 '
-        'L53 22 L60 21 L60 27 L53 30 L53 34 L60 37 L60 43 '
-        'L53 42 L47 47 L51 51 L47 55 L42 51 L37 53 L36 60 '
-        'L32 60 L28 60 L27 53 L22 51 L17 55 L13 51 L17 47 '
-        'L11 42 L4 43 L4 37 L11 34 L11 30 L4 27 L4 21 '
-        'L11 22 L17 17 L13 13 L17 9 L22 13 L27 11 L28 4 Z '
-        # Inner hole so it reads as a ring (gear teeth + open center).
-        'M32 22 a10 10 0 1 0 0 20 a10 10 0 1 0 0 -20 Z" '
-        'fill-rule="evenodd"/>'
-        # Status dot — colored, sized to fill the inner ring cleanly.
-        f'<circle cx="32" cy="32" r="7" fill="{dot_color}"/>'
+        # Outer ring — white stroke, no fill (transparent center so
+        # the dot below shows through cleanly).
+        '<circle cx="32" cy="32" r="22" fill="none" '
+        'stroke="#ffffff" stroke-width="6"/>'
+        # 12 teeth radiating outward.
+        + "".join(teeth) +
+        # Status dot — colored, fills the inner ring.
+        f'<circle cx="32" cy="32" r="9" fill="{dot_color}"/>'
         '</svg>'
     ).encode("utf-8")
 
@@ -469,7 +506,7 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         held.append(title_action)
 
         for snap in spec.procs:
-            label = f"{snap.name} [{_status_label(snap)}]"
+            label = f"{_status_glyph(snap)}  {snap.name}  ·  {_status_label(snap)}"
             sub = make_proc_submenu(snap, menu)
             sub.setTitle(label)
             menu.addMenu(sub)
@@ -506,13 +543,26 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         tray.setContextMenu(new_menu)
 
     def on_activated(reason: "QSystemTrayIcon.ActivationReason") -> None:
-        """Show the context menu on left-click (Trigger), not just right-click.
+        """Show the context menu on left-click and middle-click.
 
-        Right-click already pops the context menu via Qt's built-in
-        handling. Left-click (``Trigger``) and middle-click do
-        nothing by default — wiring them to ``popup()`` at the
-        current cursor matches what most tray apps do.
+        Right-click is handled by Qt + the host natively (it always
+        opens the ``setContextMenu`` menu). Left-click (``Trigger``)
+        and middle-click do nothing by default, so we explicitly pop
+        the same menu at the cursor.
+
+        Notes on host behavior:
+        - KDE Plasma's SNI host *should* deliver Trigger to Qt; if it
+          doesn't, the activation is being consumed by the host's own
+          left-click action (configurable in Plasma's tray settings).
+        - GNOME via AppIndicator typically routes left-click to the
+          menu directly without going through Qt's signal.
+        - macOS NSStatusItem always fires Trigger on a single click.
+
+        ``$BGO_TRAY_DEBUG=1`` prints the received reason so users can
+        diagnose host-specific quirks.
         """
+        if os.environ.get("BGO_TRAY_DEBUG"):
+            sys.stderr.write(f"bgo tray: activated reason={reason}\n")
         if reason in (
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.MiddleClick,
@@ -520,7 +570,10 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
             menu = tray.contextMenu()
             if menu is not None:
                 from PySide6.QtGui import QCursor
-                menu.popup(QCursor.pos())
+                # exec() is blocking but force-shows the menu reliably
+                # across SNI hosts. popup() is async and gets eaten by
+                # some compositors before paint.
+                menu.exec(QCursor.pos())
 
     tray.activated.connect(on_activated)
     rebuild()

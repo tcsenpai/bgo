@@ -291,14 +291,42 @@ Neither flag is set automatically — it modifies system state.
 
 ## Tray icon (optional)
 
-`bgo tray` runs a system-tray icon that lists all registered procs
-and exposes Start / Stop / Restart / Open-logs actions for each. The
-menu refreshes from `~/.bgo/procs/*.json` every few seconds and
-shells out to `bgo` for every action, so behavior matches the CLI
-exactly.
+`bgo tray` runs a system-tray icon (a gear with a colored status dot)
+that lists all registered procs and exposes one-click actions for each.
+
+**Icon dot color**:
+- 🟢 green — at least one proc running, none errored
+- 🔴 red   — any proc errored
+- ⚫ gray  — empty or all stopped
+
+**Menu**: each proc gets a submenu prefixed with a Unicode status glyph
+(● online / ○ stopped / ⚠ errored). The submenu offers Start (or
+Restart when online) / Stop / Open logs. Global entries: Resurrect all
+/ Refresh now / Quit. The menu rebuilds from `~/.bgo/procs/*.json`
+every few seconds; every action shells out to `bgo` so behavior
+matches the CLI exactly.
+
+**Open logs** spawns `bgo logs <name> -f` in a new terminal window
+(live tail with formatting), not the raw log file in an editor. Linux
+probes a curated list (kitty, alacritty, wezterm, foot, ghostty,
+gnome-terminal, konsole, xfce4-terminal, tilix, xterm) and picks the
+first one on PATH. macOS uses AppleScript to spawn Terminal.app. Set
+`BGO_TERMINAL='kitty --'` (or any `binary [exec-flag]`) for an
+explicit override; `BGO_TERMINAL=iterm` switches macOS to iTerm2.
+
+**Left- and right-click** both open the menu. Middle-click does too.
+Right-click is always handled by the host directly. Left/middle-click
+is wired by us via Qt's `activated` signal — most hosts deliver it,
+but a few (notably some KDE Plasma configurations that bind a custom
+left-click action) may swallow it; in that case right-click still
+works and the host setting is overrideable in tray config. Set
+`BGO_TRAY_DEBUG=1` to log the activation reason to stderr while
+debugging.
+
+### Platform support
 
 Tray UI uses **PySide6** (Qt for Python, LGPL). One library, native
-support on every platform we target:
+support on every target:
 
 | Platform | What happens |
 |---|---|
@@ -306,6 +334,8 @@ support on every platform we target:
 | **KDE Plasma 6 (Wayland or X11)** | StatusNotifierItem, no setup |
 | **Hyprland / sway + waybar** | SNI via waybar's `tray` module |
 | **GNOME Wayland** | Needs the AppIndicator shell extension (see below) |
+
+### Install
 
 PySide6 is shipped as an optional extra to keep the core install
 zero-dep:
@@ -325,6 +355,20 @@ pip install 'bgo-cli[tray]'
 If you forget, the first run of `bgo tray` detects your installer
 (uv tool / pipx / pip) and offers to inject the dep for you. Skip
 the confirmation with `--auto-install` or `BGO_TRAY_AUTOINSTALL=1`.
+
+### Run in the background
+
+The tray is just another command — run it under `bgo` itself:
+
+```bash
+bgo start -w bgotray -- bgo tray   # -w auto-restarts on crash
+```
+
+Or, simpler, install it as a login autostart entry:
+
+```bash
+bgo autostart install --tray       # tray starts on every login
+```
 
 ### GNOME Wayland prerequisite
 
@@ -346,6 +390,8 @@ step.
 |---|---|---|
 | `--poll N`, `BGO_TRAY_POLL` | `3` | Snapshot refresh interval (seconds) |
 | `--auto-install`, `BGO_TRAY_AUTOINSTALL=1` | off | Skip the install prompt |
+| `BGO_TERMINAL` | (auto-probe) | Terminal emulator for Open-logs (`'kitty --'`, `iterm`, etc.) |
+| `BGO_TRAY_DEBUG=1` | off | Log activation reasons to stderr |
 
 ## Storage
 
@@ -358,12 +404,13 @@ step.
 python3 -m pytest tests/ -v
 ```
 
-54 tests covering state I/O, atomic writes, command-shape detection, name derivation, liveness + zombie filtering, watch-config inheritance, and table rendering across all three levels.
+169 tests covering state I/O, atomic writes, command-shape detection, name derivation, liveness + zombie filtering, watch-config inheritance, table rendering, desktop notifications, login autostart (systemd-user / launchd), and tray menu construction.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - Linux or macOS (zombie detection is platform-aware: `/proc` on Linux, `ps -o stat=` on macOS)
+- Optional `[tray]` extra: PySide6 (Qt for Python, LGPL)
 
 ## License
 
