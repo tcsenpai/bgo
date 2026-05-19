@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bgo-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Lightweight, zero-dependency background process manager (pm2-style) with watch mode and auto-restart."
 readme = "README.md"
 requires-python = ">=3.10"
