@@ -173,30 +173,122 @@ def run_bgo(*args: str) -> int:
     return proc.returncode
 
 
-def _open_logs(name: str) -> None:
-    """Open the proc's stdout log in ``$EDITOR`` or the OS default.
+# Ordered preferences for graphical terminal emulators. We pick the
+# first one on PATH. Each tuple is (binary, exec-flag) — the flag is
+# whatever the terminal uses to mean "the rest of the argv is the
+# command to run". This list deliberately favors modern terminals
+# (kitty/wezterm/alacritty/foot) before the desktop-environment
+# defaults so users with both installed get the lighter one.
+_LINUX_TERMINALS: tuple[tuple[str, str], ...] = (
+    ("kitty", "--"),
+    ("alacritty", "-e"),
+    ("wezterm", "start"),
+    ("foot", "--"),
+    ("ghostty", "-e"),
+    ("gnome-terminal", "--"),
+    ("konsole", "-e"),
+    ("xfce4-terminal", "-e"),
+    ("tilix", "-e"),
+    ("xterm", "-e"),
+)
 
-    Failures are reported to stderr so the user has *some* signal when
-    both the editor and the OS default opener fail (e.g. headless
-    server with no xdg-open). They do not propagate — the tray loop
-    must stay alive.
+
+def _resolve_terminal() -> tuple[str, str] | None:
+    """Pick the first available terminal emulator on Linux.
+
+    Honors ``$BGO_TERMINAL`` for an explicit override; the value is
+    parsed as ``<binary> [exec-flag]`` (defaulting to ``-e`` when no
+    flag is given). Returns ``None`` if nothing usable was found.
+    """
+    override = (os.environ.get("BGO_TERMINAL") or "").strip()
+    if override:
+        parts = override.split(None, 1)
+        binary = parts[0]
+        flag = parts[1] if len(parts) > 1 else "-e"
+        if shutil.which(binary):
+            return binary, flag
+        return None
+    for binary, flag in _LINUX_TERMINALS:
+        if shutil.which(binary):
+            return binary, flag
+    return None
+
+
+def _open_logs(name: str) -> None:
+    """Open ``bgo logs <name> -f`` in a fresh terminal window.
+
+    macOS uses AppleScript to spawn Terminal.app (or iTerm2 if it's
+    set as default via ``$BGO_TERMINAL=iterm``). Linux probes a
+    curated list of common emulators and runs the first one found.
+    Any failure is written to stderr — the tray loop must stay alive.
     """
     log = BGO_DIR / "logs" / f"{name}.out.log"
     if not log.exists():
         sys.stderr.write(f"bgo tray: no log file for {name}\n")
         return
-    editor = os.environ.get("EDITOR")
-    if editor:
-        try:
-            subprocess.Popen([editor, str(log)])
-            return
-        except OSError as exc:
-            sys.stderr.write(f"bgo tray: $EDITOR ({editor}) failed: {exc}\n")
-    opener = "open" if sys.platform == "darwin" else "xdg-open"
+
+    bgo_bin = shutil.which("bgo") or str(Path(sys.argv[0]).resolve())
+    follow_cmd = [bgo_bin, "logs", name, "-f"]
+
+    if sys.platform == "darwin":
+        _open_logs_darwin(follow_cmd)
+        return
+
+    terminal = _resolve_terminal()
+    if terminal is None:
+        sys.stderr.write(
+            "bgo tray: no terminal emulator found on PATH. "
+            "Set $BGO_TERMINAL to override (e.g. BGO_TERMINAL='alacritty -e').\n"
+        )
+        return
+
+    binary, flag = terminal
+    argv = [binary, flag, *follow_cmd]
     try:
-        subprocess.Popen([opener, str(log)])
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     except OSError as exc:
-        sys.stderr.write(f"bgo tray: {opener} failed: {exc}\n")
+        sys.stderr.write(f"bgo tray: {binary} failed to launch: {exc}\n")
+
+
+def _open_logs_darwin(follow_cmd: list[str]) -> None:
+    """Spawn ``follow_cmd`` in a new Terminal.app (or iTerm) window.
+
+    AppleScript is the only friction-free way to open a fresh window
+    on macOS without writing a temporary launcher script. The command
+    is shell-quoted so paths with spaces survive the round-trip.
+    """
+    import shlex
+
+    quoted = " ".join(shlex.quote(arg) for arg in follow_cmd)
+    override = (os.environ.get("BGO_TERMINAL") or "").strip().lower()
+    use_iterm = override in ("iterm", "iterm2")
+
+    if use_iterm:
+        script = (
+            'tell application "iTerm"\n'
+            "  activate\n"
+            "  create window with default profile\n"
+            f'  tell current session of current window to write text "{quoted}"\n'
+            "end tell"
+        )
+    else:
+        script = f'tell application "Terminal" to do script "{quoted}"'
+
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        sys.stderr.write(f"bgo tray: osascript failed: {exc}\n")
 
 
 def _poll_interval() -> int:
@@ -214,17 +306,57 @@ def _poll_interval() -> int:
 # --- PySide6 glue --------------------------------------------------------
 
 
-# SVG icon embedded as a string so we don't ship binary assets. Rendered
-# in monochrome white-on-transparent, sized 64×64 so Qt downscales
-# cleanly to 16/22/24 px tray slots.
-_ICON_SVG = b"""\
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect x="10" y="14" width="44" height="8" rx="2" fill="#ffffff"/>
-  <rect x="10" y="28" width="44" height="8" rx="2" fill="#ffffff"/>
-  <rect x="10" y="42" width="44" height="8" rx="2" fill="#ffffff"/>
-</svg>
-"""
+# Status -> hex color for the gear's center dot. Chosen for contrast
+# against most tray backgrounds (both dark and light themes) and for
+# common color-blindness friendliness (green/red is suboptimal but
+# universally understood for status — paired with shape would be
+# better in a future revision).
+_DOT_COLORS: dict[str, str] = {
+    "online":  "#3ddc84",  # bright green — at least one proc running, none errored
+    "errored": "#ff5252",  # red          — any proc in errored state
+    "idle":    "#9e9e9e",  # neutral gray — nothing registered or everything stopped
+}
+
+
+def _icon_svg(dot_color: str) -> bytes:
+    """Render the gear+dot SVG with the given dot color.
+
+    The gear silhouette is a 12-tooth cog drawn with `path` data so it
+    scales crisply down to 16px. The center dot is a circle so it
+    renders solid even at the smallest size.
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+        # 12-tooth gear outline — symmetric, balanced visual weight.
+        '<path fill="#ffffff" d="'
+        'M32 4 L36 4 L37 11 L42 13 L47 9 L51 13 L47 17 '
+        'L53 22 L60 21 L60 27 L53 30 L53 34 L60 37 L60 43 '
+        'L53 42 L47 47 L51 51 L47 55 L42 51 L37 53 L36 60 '
+        'L32 60 L28 60 L27 53 L22 51 L17 55 L13 51 L17 47 '
+        'L11 42 L4 43 L4 37 L11 34 L11 30 L4 27 L4 21 '
+        'L11 22 L17 17 L13 13 L17 9 L22 13 L27 11 L28 4 Z '
+        # Inner hole so it reads as a ring (gear teeth + open center).
+        'M32 22 a10 10 0 1 0 0 20 a10 10 0 1 0 0 -20 Z" '
+        'fill-rule="evenodd"/>'
+        # Status dot — colored, sized to fill the inner ring cleanly.
+        f'<circle cx="32" cy="32" r="7" fill="{dot_color}"/>'
+        '</svg>'
+    ).encode("utf-8")
+
+
+def _aggregate_status(snapshots: list[ProcSnapshot]) -> str:
+    """Reduce a snapshot list to one status key for the icon dot.
+
+    - ``errored``  : any proc flagged ``errored`` (highest priority)
+    - ``online``   : at least one proc running, none errored
+    - ``idle``     : empty list or all procs stopped
+    """
+    if any(s.errored for s in snapshots):
+        return "errored"
+    if any(s.status == "running" for s in snapshots):
+        return "online"
+    return "idle"
 
 
 def _print_gnome_extension_hint() -> None:
@@ -279,20 +411,21 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         _print_gnome_extension_hint()
         return 1
 
-    # Render the embedded SVG into a QIcon at a useful base size. Qt
-    # picks the closest match for the tray slot at draw time.
-    renderer = QSvgRenderer(QByteArray(_ICON_SVG))
-    pixmap = QPixmap(QSize(64, 64))
-    pixmap.fill(Qt.transparent)
-    painter = QPainter(pixmap)
-    try:
-        renderer.render(painter)
-    finally:
-        painter.end()
-    icon_image = QIcon(pixmap)
+    def make_icon(dot_color: str) -> QIcon:
+        """Rasterize the gear+dot SVG into a Qt icon at 64×64."""
+        renderer = QSvgRenderer(QByteArray(_icon_svg(dot_color)))
+        pixmap = QPixmap(QSize(64, 64))
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        try:
+            renderer.render(painter)
+        finally:
+            painter.end()
+        return QIcon(pixmap)
 
-    tray = QSystemTrayIcon(icon_image)
+    tray = QSystemTrayIcon(make_icon(_DOT_COLORS["idle"]))
     tray.setToolTip("bgo")
+    current_status = {"key": "idle"}
 
     # We have to hold a reference to QMenu and every QAction (Qt
     # doesn't take ownership when added to a tray). Keeping them on a
@@ -326,8 +459,8 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         held.extend([primary, stop, logs, sub])
         return sub
 
-    def build_menu() -> QMenu:
-        spec = build_menu_spec(load_snapshots())
+    def build_menu_from(snapshots: list[ProcSnapshot]) -> QMenu:
+        spec = build_menu_spec(snapshots)
         menu = QMenu()
         title_action = QAction(spec.title, menu)
         title_action.setEnabled(False)
@@ -356,14 +489,40 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         return menu
 
     def rebuild() -> None:
-        """Replace the tray's menu with a fresh snapshot-derived build."""
+        """Replace the tray's menu and icon from the latest snapshot."""
         # Drop old refs so they can be reclaimed. Qt will free them
         # once the previous menu's slots stop firing.
         held.clear()
-        new_menu = build_menu()
+        snapshots = load_snapshots()
+        status_key = _aggregate_status(snapshots)
+        if status_key != current_status["key"]:
+            tray.setIcon(make_icon(_DOT_COLORS[status_key]))
+            current_status["key"] = status_key
+        # Tooltip echoes current status for users whose tray hides
+        # color cues (some monochrome themes recolor icons).
+        tray.setToolTip(f"bgo — {status_key}")
+        new_menu = build_menu_from(snapshots)
         held.append(new_menu)
         tray.setContextMenu(new_menu)
 
+    def on_activated(reason: "QSystemTrayIcon.ActivationReason") -> None:
+        """Show the context menu on left-click (Trigger), not just right-click.
+
+        Right-click already pops the context menu via Qt's built-in
+        handling. Left-click (``Trigger``) and middle-click do
+        nothing by default — wiring them to ``popup()`` at the
+        current cursor matches what most tray apps do.
+        """
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.MiddleClick,
+        ):
+            menu = tray.contextMenu()
+            if menu is not None:
+                from PySide6.QtGui import QCursor
+                menu.popup(QCursor.pos())
+
+    tray.activated.connect(on_activated)
     rebuild()
     tray.show()
 

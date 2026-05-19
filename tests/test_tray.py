@@ -164,3 +164,189 @@ def test_run_bgo_falls_back_to_argv0_when_which_misses(
     assert run.call_args.args[0][0] == str(fake.resolve())
 
 
+# --- _resolve_terminal --------------------------------------------------
+
+
+def test_resolve_terminal_returns_none_when_nothing_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BGO_TERMINAL", raising=False)
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: None)
+    assert _tray._resolve_terminal() is None
+
+
+def test_resolve_terminal_picks_first_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probes in order; the first hit wins."""
+    monkeypatch.delenv("BGO_TERMINAL", raising=False)
+
+    # Only ``foot`` is on PATH — it should win over later xterm even
+    # though both are in the candidate list.
+    def fake_which(binary: str) -> str | None:
+        return "/usr/bin/foot" if binary == "foot" else None
+
+    monkeypatch.setattr(_tray.shutil, "which", side_effect=fake_which) \
+        if hasattr(monkeypatch, "setattr_side_effect") else monkeypatch.setattr(
+            _tray.shutil, "which", fake_which
+        )
+    result = _tray._resolve_terminal()
+    assert result == ("foot", "--")
+
+
+def test_resolve_terminal_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BGO_TERMINAL", "alacritty -e")
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: "/usr/bin/alacritty")
+    assert _tray._resolve_terminal() == ("alacritty", "-e")
+
+
+def test_resolve_terminal_override_defaults_to_dash_e_when_unspecified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BGO_TERMINAL", "weirdterm")
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: "/x/weirdterm")
+    assert _tray._resolve_terminal() == ("weirdterm", "-e")
+
+
+def test_resolve_terminal_override_not_found_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit override misses -> None, not silent fallback."""
+    monkeypatch.setenv("BGO_TERMINAL", "missing-term")
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: None)
+    assert _tray._resolve_terminal() is None
+
+
+# --- _open_logs ---------------------------------------------------------
+
+
+def test_open_logs_warns_when_no_log_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing log file -> stderr hint, no terminal launched."""
+    monkeypatch.setattr(_tray, "BGO_DIR", tmp_path)
+    with mock.patch.object(_tray.subprocess, "Popen") as popen:
+        _tray._open_logs("nope")
+    popen.assert_not_called()
+    err = capsys.readouterr().err
+    assert "no log file" in err
+
+
+def test_open_logs_linux_spawns_terminal_with_follow_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Linux path: invoke the resolved terminal with ``bgo logs <name> -f``."""
+    monkeypatch.setattr(_tray, "BGO_DIR", tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "web.out.log").write_text("")
+    monkeypatch.setattr(_tray.sys, "platform", "linux")
+    monkeypatch.setattr(_tray.shutil, "which", lambda b: "/bin/bgo" if b == "bgo" else "/usr/bin/kitty")
+    monkeypatch.setattr(_tray, "_resolve_terminal", lambda: ("kitty", "--"))
+    with mock.patch.object(_tray.subprocess, "Popen") as popen:
+        _tray._open_logs("web")
+    popen.assert_called_once()
+    argv = popen.call_args.args[0]
+    assert argv[0] == "kitty"
+    assert argv[1] == "--"
+    assert argv[-3:] == ["logs", "web", "-f"]
+
+
+def test_open_logs_linux_no_terminal_writes_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(_tray, "BGO_DIR", tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "web.out.log").write_text("")
+    monkeypatch.setattr(_tray.sys, "platform", "linux")
+    monkeypatch.setattr(_tray, "_resolve_terminal", lambda: None)
+    with mock.patch.object(_tray.subprocess, "Popen") as popen:
+        _tray._open_logs("web")
+    popen.assert_not_called()
+    err = capsys.readouterr().err
+    assert "BGO_TERMINAL" in err
+
+
+def test_open_logs_darwin_uses_osascript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_tray, "BGO_DIR", tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "api.out.log").write_text("")
+    monkeypatch.setattr(_tray.sys, "platform", "darwin")
+    monkeypatch.delenv("BGO_TERMINAL", raising=False)
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: "/bin/bgo")
+    with mock.patch.object(_tray.subprocess, "Popen") as popen:
+        _tray._open_logs("api")
+    argv = popen.call_args.args[0]
+    assert argv[0] == "osascript"
+    assert "Terminal" in argv[-1]
+    assert "logs api -f" in argv[-1]
+
+
+# --- _aggregate_status --------------------------------------------------
+
+
+def test_aggregate_status_empty_is_idle() -> None:
+    assert _tray._aggregate_status([]) == "idle"
+
+
+def test_aggregate_status_all_stopped_is_idle() -> None:
+    snaps = [
+        _tray.ProcSnapshot("a", "stopped", None, errored=False),
+        _tray.ProcSnapshot("b", "stopped", None, errored=False),
+    ]
+    assert _tray._aggregate_status(snaps) == "idle"
+
+
+def test_aggregate_status_any_running_is_online() -> None:
+    snaps = [
+        _tray.ProcSnapshot("a", "stopped", None, errored=False),
+        _tray.ProcSnapshot("b", "running", 100, errored=False),
+    ]
+    assert _tray._aggregate_status(snaps) == "online"
+
+
+def test_aggregate_status_errored_dominates_running() -> None:
+    """Errored is highest priority, even if other procs are healthy."""
+    snaps = [
+        _tray.ProcSnapshot("a", "running", 100, errored=False),
+        _tray.ProcSnapshot("b", "stopped", None, errored=True),
+    ]
+    assert _tray._aggregate_status(snaps) == "errored"
+
+
+# --- _icon_svg ----------------------------------------------------------
+
+
+def test_icon_svg_embeds_requested_color() -> None:
+    """The dot color reaches the rendered SVG verbatim."""
+    svg = _tray._icon_svg("#3ddc84")
+    assert b'fill="#3ddc84"' in svg
+    assert svg.startswith(b"<?xml")
+
+
+def test_icon_svg_known_status_colors_unique() -> None:
+    """Three statuses produce three distinct icons."""
+    seen = {_tray._icon_svg(c) for c in _tray._DOT_COLORS.values()}
+    assert len(seen) == len(_tray._DOT_COLORS)
+
+
+def test_open_logs_darwin_iterm_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_tray, "BGO_DIR", tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "api.out.log").write_text("")
+    monkeypatch.setattr(_tray.sys, "platform", "darwin")
+    monkeypatch.setenv("BGO_TERMINAL", "iterm")
+    monkeypatch.setattr(_tray.shutil, "which", lambda _: "/bin/bgo")
+    with mock.patch.object(_tray.subprocess, "Popen") as popen:
+        _tray._open_logs("api")
+    argv = popen.call_args.args[0]
+    assert "iTerm" in argv[-1]
+
+
