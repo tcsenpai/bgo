@@ -47,8 +47,7 @@ dev = [
     "twine>=4.0",
 ]
 tray = [
-    "pystray>=0.19",
-    "Pillow>=10",
+    "PySide6>=6.6",
 ]
 
 [project.scripts]

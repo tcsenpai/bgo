@@ -1,14 +1,14 @@
 """Auto-install logic for the optional ``[tray]`` extra.
 
-The tray UI needs ``pystray`` and ``Pillow`` — both heavy enough that
-we intentionally keep them out of the default install. When the user
-runs ``bgo tray`` without those deps present, this module detects how
-``bgo`` itself was installed and proposes the matching install
-command:
+The tray UI needs ``PySide6`` (Qt for Python, LGPL). It's heavy
+enough that we intentionally keep it out of the default install.
+When the user runs ``bgo tray`` without it present, this module
+detects how ``bgo`` itself was installed and proposes the matching
+install command:
 
-* ``uv tool``  -> ``uv tool install --upgrade --with pystray --with Pillow bgo-cli``
-* ``pipx``     -> ``pipx inject bgo-cli pystray Pillow``
-* anything else -> ``pip install --user pystray Pillow``
+* ``uv tool``  -> ``uv tool install --upgrade --with PySide6 bgo-cli``
+* ``pipx``     -> ``pipx inject bgo-cli PySide6``
+* anything else -> ``pip install --user PySide6``
 
 Detection is heuristic but reliable in practice: each installer
 leaves its name in ``sys.prefix`` (e.g. ``~/.local/share/uv/tools/bgo-cli``).
@@ -67,18 +67,18 @@ def detect_installer() -> InstallerKind:
 
 
 def _command_for(installer: InstallerKind) -> list[str]:
-    """Return the argv that injects ``pystray`` + ``Pillow``."""
+    """Return the argv that injects ``PySide6``."""
     if installer == "uv":
         return [
             "uv", "tool", "install", "--upgrade",
-            "--with", "pystray", "--with", "Pillow",
+            "--with", "PySide6",
             "bgo-cli",
         ]
     if installer == "pipx":
-        return ["pipx", "inject", "bgo-cli", "pystray", "Pillow"]
+        return ["pipx", "inject", "bgo-cli", "PySide6"]
     return [
         sys.executable, "-m", "pip", "install", "--user",
-        "pystray", "Pillow",
+        "PySide6",
     ]
 
 
@@ -125,8 +125,10 @@ def ensure_installed(auto: bool = False) -> bool:
        continue in-process — but re-exec is still the safe default.
     """
     try:
-        import pystray  # noqa: F401  (presence check only)
-        import PIL  # noqa: F401
+        import PySide6  # noqa: F401  (presence check only)
+        # PySide6 imports lazily; verify the QtWidgets submodule loads
+        # too so we catch broken installs early.
+        from PySide6 import QtWidgets  # noqa: F401
         return True
     except ImportError:
         pass
@@ -135,9 +137,9 @@ def ensure_installed(auto: bool = False) -> bool:
     argv = _command_for(installer)
 
     print(
-        f"{_ansi('yellow', '⚠')}  Tray requires "
-        f"{_ansi('bold', 'pystray')} and {_ansi('bold', 'Pillow')}. "
-        f"Detected installer: {_ansi('bold', installer)}."
+        f"{_ansi('yellow', '⚠')}  Tray requires {_ansi('bold', 'PySide6')} "
+        f"(Qt for Python, LGPL). Detected installer: "
+        f"{_ansi('bold', installer)}."
     )
     print(f"   Proposed command: {_ansi('bold', ' '.join(argv))}")
 

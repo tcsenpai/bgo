@@ -1,7 +1,7 @@
 """Tests for the pure (toolkit-free) helpers in ``bgo_cli._tray``.
 
-Anything that needs ``pystray`` or ``PIL`` lives in ``_run_tray`` and
-is intentionally not covered here — it requires the optional extra
+Anything that needs ``PySide6`` (Qt) lives in ``_run_tray`` and is
+intentionally not covered here — it requires the optional extra
 ``bgo-cli[tray]`` and is exercised by the smoke-run in a dev install.
 """
 
@@ -162,3 +162,5 @@ def test_run_bgo_falls_back_to_argv0_when_which_misses(
     with mock.patch.object(_tray.subprocess, "run", return_value=completed) as run:
         _tray.run_bgo("ls")
     assert run.call_args.args[0][0] == str(fake.resolve())
+
+

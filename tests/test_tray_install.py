@@ -54,14 +54,13 @@ def test_detect_installer_honors_uv_tool_dir_env(
 def test_command_for_uv() -> None:
     argv = _tray_install._command_for("uv")
     assert argv[:3] == ["uv", "tool", "install"]
-    assert "pystray" in argv
-    assert "Pillow" in argv
+    assert "PySide6" in argv
     assert argv[-1] == "bgo-cli"
 
 
 def test_command_for_pipx() -> None:
     assert _tray_install._command_for("pipx") == [
-        "pipx", "inject", "bgo-cli", "pystray", "Pillow"
+        "pipx", "inject", "bgo-cli", "PySide6"
     ]
 
 
@@ -70,8 +69,7 @@ def test_command_for_pip_uses_current_python(monkeypatch: pytest.MonkeyPatch) ->
     argv = _tray_install._command_for("pip")
     assert argv[:3] == ["/python", "-m", "pip"]
     assert "--user" in argv
-    assert "pystray" in argv
-    assert "Pillow" in argv
+    assert "PySide6" in argv
 
 
 # --- _installer_available -----------------------------------------------
@@ -97,11 +95,13 @@ def test_installer_available_pip_always_true() -> None:
 def test_ensure_installed_short_circuits_when_deps_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If pystray + PIL import cleanly, no install command runs."""
-    fake_pystray = mock.MagicMock()
-    fake_pil = mock.MagicMock()
-    monkeypatch.setitem(_tray_install.sys.modules, "pystray", fake_pystray)
-    monkeypatch.setitem(_tray_install.sys.modules, "PIL", fake_pil)
+    """If PySide6 imports cleanly, no install command runs."""
+    fake_pyside = mock.MagicMock()
+    fake_qtwidgets = mock.MagicMock()
+    monkeypatch.setitem(_tray_install.sys.modules, "PySide6", fake_pyside)
+    monkeypatch.setitem(
+        _tray_install.sys.modules, "PySide6.QtWidgets", fake_qtwidgets
+    )
     with mock.patch.object(_tray_install.subprocess, "run") as run:
         ok = _tray_install.ensure_installed(auto=False)
     assert ok is True
@@ -113,17 +113,19 @@ def test_ensure_installed_short_circuits_when_deps_present(
 
 @pytest.fixture
 def missing_deps(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force the ``import pystray`` line inside ``ensure_installed`` to fail."""
+    """Force the ``import PySide6`` line inside ``ensure_installed`` to fail."""
     # Drop any cached modules from the importer.
-    monkeypatch.delitem(_tray_install.sys.modules, "pystray", raising=False)
-    monkeypatch.delitem(_tray_install.sys.modules, "PIL", raising=False)
+    monkeypatch.delitem(_tray_install.sys.modules, "PySide6", raising=False)
+    monkeypatch.delitem(
+        _tray_install.sys.modules, "PySide6.QtWidgets", raising=False
+    )
 
     real_import = __builtins__["__import__"] if isinstance(
         __builtins__, dict
     ) else __import__
 
     def fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if name in ("pystray", "PIL"):
+        if name == "PySide6" or name.startswith("PySide6."):
             raise ImportError(f"no module named {name!r}")
         return real_import(name, *args, **kwargs)
 

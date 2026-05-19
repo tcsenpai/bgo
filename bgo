@@ -1786,7 +1786,7 @@ def cmd_autostart(args):
 def cmd_tray(args):
     """Launch the system-tray icon (optional extra ``bgo-cli[tray]``).
 
-    If pystray/Pillow are not importable, delegates to
+    If PySide6 is not importable, delegates to
     ``_tray_install.ensure_installed`` which detects the install
     context (uv tool / pipx / pip) and offers to inject the deps.
     """
@@ -1808,7 +1808,7 @@ def cmd_tray(args):
         # deps are picked up by a clean interpreter. We prefer
         # shutil.which("bgo") over sys.argv[0] because argv[0] may be
         # the bare script path ("./bgo") or "python", neither of which
-        # have the new pystray on their import path after a uv/pipx
+        # have the new PySide6 on their import path after a uv/pipx
         # injection completed.
         bgo_bin = shutil.which("bgo") or sys.argv[0]
         os.execvp(bgo_bin, [bgo_bin, "tray"])
@@ -2150,7 +2150,7 @@ Watch mode (auto-restart on crash):
     )
     tray_parser.add_argument(
         "--auto-install", dest="auto_install", action="store_true",
-        help="Install pystray/Pillow without confirmation if missing",
+        help="Install PySide6 without confirmation if missing",
     )
 
     args = parser.parse_args()

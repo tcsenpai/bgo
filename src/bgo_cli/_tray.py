@@ -1,21 +1,29 @@
 """System-tray icon for bgo (optional extra ``bgo-cli[tray]``).
 
 This module is imported lazily by ``cmd_tray`` and is the only place
-``pystray`` / ``Pillow`` are referenced at runtime. Splitting the
-import-bearing glue (``_run_tray``) from the pure menu construction
-(``build_menu_spec``) lets us unit-test the menu without the optional
-deps installed.
+PySide6 (Qt) is referenced at runtime. Splitting the import-bearing
+glue (``_run_tray``) from the pure menu construction
+(``build_menu_spec``) lets us unit-test the menu without Qt installed.
+
+Why PySide6
+===========
+We tried ``pystray`` first. Its default Xorg backend cannot dock under
+Wayland (no XEMBED system-tray manager), and its AppIndicator backend
+needs distro-specific GI typelibs plus a GNOME shell extension. Qt's
+``QSystemTrayIcon`` speaks the StatusNotifierItem (SNI) protocol
+natively, so it works on **KDE Plasma 6**, **Hyprland + waybar**, and
+other SNI-capable bars without extra setup, and falls back to native
+``NSStatusItem`` on **macOS**. GNOME Wayland still requires the
+``AppIndicator and KStatusNotifierItem Support`` shell extension, but
+that's a GNOME limitation; no Python library can paper over it.
 
 UI model
 ========
 We poll ``~/.bgo/procs/*.json`` every ``poll_seconds`` (default 3,
-overridable by ``$BGO_TRAY_POLL`` or ``--poll``). The full menu is
-rebuilt from the snapshot — pystray rebuilds cheaply, and a
-declarative menu avoids the bugs that come from in-place mutation.
-
-Actions never duplicate state-management logic from the core script.
-Every Start/Stop/Restart click shells out to the ``bgo`` binary, so
-behavior matches the CLI exactly and we don't risk diverging.
+overridable by ``$BGO_TRAY_POLL`` or ``--poll``) on a Qt ``QTimer`` so
+all menu rebuilds happen on the GUI thread. Actions never duplicate
+state-management logic from the core script — every click shells out
+to the ``bgo`` binary, so behavior matches the CLI exactly.
 """
 
 from __future__ import annotations
@@ -203,122 +211,171 @@ def _poll_interval() -> int:
     return _DEFAULT_POLL_SECONDS
 
 
-# --- pystray glue --------------------------------------------------------
+# --- PySide6 glue --------------------------------------------------------
 
 
-def _make_icon_image():  # pragma: no cover — exercised only with Pillow
-    """Build a tiny B/W icon image. Imported lazily so tests don't need PIL."""
-    from PIL import Image, ImageDraw
+# SVG icon embedded as a string so we don't ship binary assets. Rendered
+# in monochrome white-on-transparent, sized 64×64 so Qt downscales
+# cleanly to 16/22/24 px tray slots.
+_ICON_SVG = b"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect x="10" y="14" width="44" height="8" rx="2" fill="#ffffff"/>
+  <rect x="10" y="28" width="44" height="8" rx="2" fill="#ffffff"/>
+  <rect x="10" y="42" width="44" height="8" rx="2" fill="#ffffff"/>
+</svg>
+"""
 
-    size = 64
-    img = Image.new("RGB", (size, size), "black")
-    draw = ImageDraw.Draw(img)
-    # Three horizontal bars — readable at 16px.
-    for y in (14, 28, 42):
-        draw.rectangle((10, y, size - 10, y + 8), fill="white")
-    return img
 
+def _print_gnome_extension_hint() -> None:
+    """Hint shown when QSystemTrayIcon.isSystemTrayAvailable is False.
 
-def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs pystray
-    """Run the pystray event loop until the user quits.
-
-    This is the only function in the module that requires the optional
-    deps. Kept thin: the bulk of behavior lives in the pure helpers
-    above so it stays testable.
+    The most common culprit on Linux is GNOME without the AppIndicator
+    extension. On macOS this path is essentially unreachable. On other
+    Wayland desktops (KDE / Hyprland / sway+waybar) the SNI host is
+    typically already running, so a False reading usually means the
+    user is in a non-graphical session (sshd, ttyN).
     """
-    import pystray
-    from pystray import MenuItem as Item, Menu
-
-    quit_flag = {"stop": False}
-
-    # pystray's MenuItem inspects the action's argspec and rejects
-    # callables with more than the (icon, item) positional pair. Using
-    # ``lambda _icon, _it, n=name: ...`` to bind loop variables fools
-    # the introspector, so we use proper closure factories instead.
-    def bgo_action(*args: str):
-        """Return a 2-arg callable that runs ``bgo <args>``."""
-        def _action(_icon, _item):  # noqa: ANN001 — pystray contract
-            run_bgo(*args)
-        return _action
-
-    def open_logs_action(name: str):
-        """Return a 2-arg callable that opens ``name``'s log."""
-        def _action(_icon, _item):  # noqa: ANN001
-            _open_logs(name)
-        return _action
-
-    def refresh_action():
-        """Return a 2-arg callable that rebuilds the menu in place."""
-        def _action(icon, _item):  # noqa: ANN001
-            icon.menu = build_menu()
-            icon.update_menu()
-        return _action
-
-    def quit_action():
-        """Return a 2-arg callable that signals the poller and stops."""
-        def _action(icon, _item):  # noqa: ANN001
-            quit_flag["stop"] = True
-            icon.stop()
-        return _action
-
-    def make_proc_submenu(snap: ProcSnapshot) -> Menu:
-        # ``bgo start <name>`` without a command argument is rejected
-        # by the core CLI (start requires REMAINDER). For a known
-        # registered proc the correct re-spawn is ``bgo restart``,
-        # which preserves the stored command. We surface "Restart"
-        # for online procs and "Start" for stopped ones — both labels
-        # route to the same ``bgo restart`` underneath.
-        is_running = snap.status == "running" and not snap.errored
-        primary_label = "Restart" if is_running else "Start"
-        return Menu(
-            Item(primary_label, bgo_action("restart", snap.name)),
-            Item("Stop",        bgo_action("stop", snap.name)),
-            Menu.SEPARATOR,
-            Item("Open logs",   open_logs_action(snap.name)),
-        )
-
-    def build_menu() -> Menu:
-        spec = build_menu_spec(load_snapshots())
-        items: list = [Item(spec.title, None, enabled=False), Menu.SEPARATOR]
-        for snap in spec.procs:
-            label = f"{snap.name} [{_status_label(snap)}]"
-            items.append(Item(label, make_proc_submenu(snap)))
-        items.append(Menu.SEPARATOR)
-        for label, cmd in spec.actions:
-            if cmd == "__quit__":
-                items.append(Item(label, quit_action()))
-            elif cmd == "__refresh__":
-                items.append(Item(label, refresh_action()))
-            else:
-                items.append(Item(label, bgo_action(cmd)))
-        return Menu(*items)
-
-    icon = pystray.Icon(
-        "bgo",
-        icon=_make_icon_image(),
-        title="bgo",
-        menu=build_menu(),
+    sys.stderr.write(
+        "\nbgo tray: no system tray is currently available.\n"
+        "  GNOME Wayland users need the AppIndicator shell extension:\n"
+        "    sudo dnf install gnome-shell-extension-appindicator   # Fedora\n"
+        "    sudo apt install gnome-shell-extension-appindicator   # Debian\n"
+        "    gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com\n"
+        "  KDE Plasma, Hyprland + waybar, and macOS should work out of the\n"
+        "  box — if they don't, make sure you're running in a graphical\n"
+        "  session (not over plain SSH).\n"
     )
 
-    # Periodically rebuild the menu so status reflects fresh snapshots.
-    import threading
 
-    def poller() -> None:
-        import time
-        while not quit_flag["stop"]:
-            time.sleep(poll_seconds)
-            try:
-                icon.menu = build_menu()
-                icon.update_menu()
-            except Exception:
-                # Pystray internals are toolkit-specific; swallow to
-                # keep the loop alive on transient errors.
-                pass
+def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
+    """Run the Qt event loop until the user quits.
 
-    t = threading.Thread(target=poller, daemon=True)
-    t.start()
-    icon.run()
-    return 0
+    This function is the only place PySide6 is touched. Everything
+    else in the module is framework-agnostic and unit-tested without
+    Qt installed.
+    """
+    try:
+        from PySide6.QtCore import QByteArray, QTimer
+        from PySide6.QtGui import QAction, QIcon, QPixmap
+        from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+        from PySide6.QtSvg import QSvgRenderer
+        from PySide6.QtCore import QSize, Qt
+        from PySide6.QtGui import QPainter
+    except ImportError as exc:
+        sys.stderr.write(
+            f"bgo tray: PySide6 not available: {exc}\n"
+            "  Install the tray extra with one of:\n"
+            "    uv tool install bgo-cli --with PySide6\n"
+            "    pipx inject bgo-cli PySide6\n"
+            "    pip install 'bgo-cli[tray]'\n"
+        )
+        return 1
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # tray-only apps have no window
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        _print_gnome_extension_hint()
+        return 1
+
+    # Render the embedded SVG into a QIcon at a useful base size. Qt
+    # picks the closest match for the tray slot at draw time.
+    renderer = QSvgRenderer(QByteArray(_ICON_SVG))
+    pixmap = QPixmap(QSize(64, 64))
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    try:
+        renderer.render(painter)
+    finally:
+        painter.end()
+    icon_image = QIcon(pixmap)
+
+    tray = QSystemTrayIcon(icon_image)
+    tray.setToolTip("bgo")
+
+    # We have to hold a reference to QMenu and every QAction (Qt
+    # doesn't take ownership when added to a tray). Keeping them on a
+    # closure-captured list survives garbage collection of the locals.
+    held: list[object] = []
+
+    def make_proc_submenu(snap: ProcSnapshot, parent: QMenu) -> QMenu:
+        # ``bgo start <name>`` without a command is rejected by the
+        # core CLI (start requires REMAINDER). For a registered proc
+        # the correct respawn is ``bgo restart``, which preserves the
+        # stored command. We label it Restart for online procs and
+        # Start for stopped ones — same code path under the hood.
+        sub = QMenu(snap.name, parent)
+        is_running = snap.status == "running" and not snap.errored
+        primary_label = "Restart" if is_running else "Start"
+
+        primary = QAction(primary_label, sub)
+        primary.triggered.connect(lambda *_: run_bgo("restart", snap.name))
+        sub.addAction(primary)
+
+        stop = QAction("Stop", sub)
+        stop.triggered.connect(lambda *_: run_bgo("stop", snap.name))
+        sub.addAction(stop)
+
+        sub.addSeparator()
+
+        logs = QAction("Open logs", sub)
+        logs.triggered.connect(lambda *_: _open_logs(snap.name))
+        sub.addAction(logs)
+
+        held.extend([primary, stop, logs, sub])
+        return sub
+
+    def build_menu() -> QMenu:
+        spec = build_menu_spec(load_snapshots())
+        menu = QMenu()
+        title_action = QAction(spec.title, menu)
+        title_action.setEnabled(False)
+        menu.addAction(title_action)
+        menu.addSeparator()
+        held.append(title_action)
+
+        for snap in spec.procs:
+            label = f"{snap.name} [{_status_label(snap)}]"
+            sub = make_proc_submenu(snap, menu)
+            sub.setTitle(label)
+            menu.addMenu(sub)
+
+        menu.addSeparator()
+        for label, cmd in spec.actions:
+            act = QAction(label, menu)
+            if cmd == "__quit__":
+                act.triggered.connect(app.quit)
+            elif cmd == "__refresh__":
+                act.triggered.connect(lambda *_: rebuild())
+            else:
+                act.triggered.connect(lambda *_, c=cmd: run_bgo(c))
+            menu.addAction(act)
+            held.append(act)
+
+        return menu
+
+    def rebuild() -> None:
+        """Replace the tray's menu with a fresh snapshot-derived build."""
+        # Drop old refs so they can be reclaimed. Qt will free them
+        # once the previous menu's slots stop firing.
+        held.clear()
+        new_menu = build_menu()
+        held.append(new_menu)
+        tray.setContextMenu(new_menu)
+
+    rebuild()
+    tray.show()
+
+    # QTimer keeps the polling on Qt's main thread; no GIL juggling,
+    # no thread-unsafe menu mutation.
+    timer = QTimer()
+    timer.setInterval(max(1, poll_seconds) * 1000)
+    timer.timeout.connect(rebuild)
+    timer.start()
+    held.append(timer)
+
+    return int(app.exec())
 
 
 def run(poll_seconds: int | None = None) -> int:

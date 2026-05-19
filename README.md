@@ -297,33 +297,55 @@ menu refreshes from `~/.bgo/procs/*.json` every few seconds and
 shells out to `bgo` for every action, so behavior matches the CLI
 exactly.
 
-Tray UI needs `pystray` and `Pillow`. They're shipped as an optional
-extra to keep the core install zero-dep:
+Tray UI uses **PySide6** (Qt for Python, LGPL). One library, native
+support on every platform we target:
+
+| Platform | What happens |
+|---|---|
+| **macOS** | Native `NSStatusItem` in the menu bar |
+| **KDE Plasma 6 (Wayland or X11)** | StatusNotifierItem, no setup |
+| **Hyprland / sway + waybar** | SNI via waybar's `tray` module |
+| **GNOME Wayland** | Needs the AppIndicator shell extension (see below) |
+
+PySide6 is shipped as an optional extra to keep the core install
+zero-dep:
 
 ```bash
 # uv (recommended)
-uv tool install bgo-cli --with pystray --with Pillow
+uv tool install bgo-cli --with PySide6
 
 # pipx
 pipx install bgo-cli
-pipx inject bgo-cli pystray Pillow
+pipx inject bgo-cli PySide6
 
 # pip
 pip install 'bgo-cli[tray]'
 ```
 
 If you forget, the first run of `bgo tray` detects your installer
-(uv tool / pipx / pip) and offers to inject the deps for you. Skip
+(uv tool / pipx / pip) and offers to inject the dep for you. Skip
 the confirmation with `--auto-install` or `BGO_TRAY_AUTOINSTALL=1`.
+
+### GNOME Wayland prerequisite
+
+GNOME ships no system-tray host of its own. Install the
+`AppIndicator and KStatusNotifierItem Support` shell extension once:
+
+```bash
+sudo dnf install gnome-shell-extension-appindicator   # Fedora
+sudo apt install gnome-shell-extension-appindicator   # Debian/Ubuntu
+gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+```
+
+Log out and back in. KDE / Hyprland / macOS users do not need this
+step.
+
+### Tuning
 
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--poll N`, `BGO_TRAY_POLL` | `3` | Snapshot refresh interval (seconds) |
 | `--auto-install`, `BGO_TRAY_AUTOINSTALL=1` | off | Skip the install prompt |
-
-Wayland support depends on your compositor — GNOME needs the
-"AppIndicator" extension; KDE and most wlroots compositors work out
-of the box.
 
 ## Storage
 
