@@ -18,659 +18,90 @@ import tty
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Config
-BGO_DIR = Path.home() / ".bgo"
-PROCS_DIR = BGO_DIR / "procs"
-LOGS_DIR = BGO_DIR / "logs"
 
-# ANSI colors
-COLORS = {
-    "green": "\033[32m",
-    "red": "\033[31m",
-    "yellow": "\033[33m",
-    "blue": "\033[34m",
-    "gray": "\033[90m",
-    "reset": "\033[0m",
-    "bold": "\033[1m",
-}
-
-ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-
-
-def color(name: str, text: str) -> str:
-    """Wrap text in color codes, only if stdout is a TTY."""
-    if not sys.stdout.isatty():
-        return str(text)
-    return f"{COLORS.get(name, '')}{text}{COLORS['reset']}"
-
-
-def strip_ansi(s: str) -> str:
-    """Remove ANSI escape codes from a string."""
-    return ANSI_RE.sub("", s)
-
-
-def truncate(s: str, width: int) -> str:
-    """Truncate string to fit in width, accounting for ANSI codes."""
-    plain = strip_ansi(s)
-    if len(plain) > width:
-        return s[: width - 3] + "..."
-    return s
-
-
-# --- Terminal capability detection ---
-
-# Three levels:
-#   plain  — no color, ASCII-only dashes, no glyphs (CI logs, dumb terms,
-#            non-TTY pipes)
-#   normal — ANSI color + ASCII dashes (default for color-capable TTYs)
-#   fancy  — ANSI color + Unicode box-drawing + heavier visual structure
-#            (UTF-8-capable TTYs)
-LEVEL_PLAIN = "plain"
-LEVEL_NORMAL = "normal"
-LEVEL_FANCY = "fancy"
-
-
-def _detect_table_level(force: str | None = None) -> str:
-    """Decide which rendering level to use.
-
-    Resolution order:
-      1. explicit `force` (from --plain/--fancy or BGO_TABLE env)
-      2. non-TTY stdout         -> plain
-      3. TERM=dumb              -> plain
-      4. LANG/LC_* lacks UTF-8  -> normal
-      5. otherwise              -> fancy
-    """
-    if force in (LEVEL_PLAIN, LEVEL_NORMAL, LEVEL_FANCY):
-        return force
-    env_force = os.environ.get("BGO_TABLE", "").strip().lower()
-    if env_force in (LEVEL_PLAIN, LEVEL_NORMAL, LEVEL_FANCY):
-        return env_force
-    if not sys.stdout.isatty():
-        return LEVEL_PLAIN
-    if os.environ.get("TERM", "") == "dumb":
-        return LEVEL_PLAIN
-    lc = (
-        os.environ.get("LC_ALL")
-        or os.environ.get("LC_CTYPE")
-        or os.environ.get("LANG")
-        or ""
-    ).upper()
-    if "UTF-8" not in lc and "UTF8" not in lc:
-        return LEVEL_NORMAL
-    return LEVEL_FANCY
-
-
-# Glyph set per level. Keys must be identical across levels so callers
-# can index without branching.
-GLYPHS = {
-    LEVEL_PLAIN: {
-        "hline": "-", "vline": "|", "cross": "+",
-        "tl": "+", "tr": "+", "bl": "+", "br": "+",
-        "tdown": "+", "tup": "+", "tleft": "+", "tright": "+",
-        "online": "ON", "stopped": "OFF",
-        "watching": "[W]", "errored": "[!]", "watcher_dead": "[?]",
-        "watch_none": "-",
-        "ok": "OK", "fail": "FAIL", "warn": "WARN",
-        "tombstone": "[X]", "rocket": "[+]", "eye": "[W]",
-    },
-    LEVEL_NORMAL: {
-        "hline": "─", "vline": "│", "cross": "┼",
-        "tl": "┌", "tr": "┐", "bl": "└", "br": "┘",
-        "tdown": "┬", "tup": "┴", "tleft": "┤", "tright": "├",
-        "online": "online", "stopped": "stopped",
-        "watching": "✓", "errored": "⚠", "watcher_dead": "!",
-        "watch_none": "-",
-        "ok": "✅", "fail": "❌", "warn": "⚠️",
-        "tombstone": "🗑️", "rocket": "🚀", "eye": "👁",
-    },
-    LEVEL_FANCY: {
-        "hline": "━", "vline": "┃", "cross": "╋",
-        "tl": "┏", "tr": "┓", "bl": "┗", "br": "┛",
-        "tdown": "┳", "tup": "┻", "tleft": "┫", "tright": "┣",
-        "online": "● online", "stopped": "○ stopped",
-        "watching": "✓", "errored": "⚠", "watcher_dead": "!",
-        "watch_none": "·",
-        "ok": "✅", "fail": "❌", "warn": "⚠️",
-        "tombstone": "🗑️", "rocket": "🚀", "eye": "👁",
-    },
-}
-
-
-def glyphs(level: str | None = None) -> dict:
-    """Return the glyph set for a level (default: auto-detect)."""
-    return GLYPHS[level or _detect_table_level()]
-
-
-def init_dirs():
-    """Initialize required directories."""
-    PROCS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# --- State management (one file per process) ---
-
-
-def proc_file(name: str) -> Path:
-    return PROCS_DIR / f"{name}.json"
-
-
-def log_path(name: str, stream: str = "out") -> Path:
-    return LOGS_DIR / f"{name}.{stream}.log"
-
-
-def watcher_log_path(name: str) -> Path:
-    return LOGS_DIR / f"{name}.watcher.log"
-
-
-def watcher_log(name: str, msg: str):
-    """Append timestamped line to watcher log."""
-    try:
-        ts = datetime.now().isoformat(timespec="seconds")
-        with open(watcher_log_path(name), "a") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except OSError:
-        pass
-
-
-def load_proc(name: str) -> dict | None:
-    pf = proc_file(name)
-    if not pf.exists():
-        return None
-    try:
-        return json.loads(pf.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def save_proc(name: str, info: dict):
-    """Atomic write: tmp file + os.replace.
-
-    Prevents torn JSON if the process is killed mid-write or if the
-    watcher and the foreground CLI both save concurrently. os.replace
-    is atomic on POSIX when src and dst are on the same filesystem,
-    which is guaranteed here (both under ~/.bgo/procs/).
-    """
-    pf = proc_file(name)
-    tmp = pf.with_suffix(pf.suffix + ".tmp")
-    tmp.write_text(json.dumps(info, indent=2))
-    os.replace(tmp, pf)
-
-
-def delete_proc(name: str, keep_logs: bool = False):
-    """Remove proc state file. Logs removed unless keep_logs=True."""
-    proc_file(name).unlink(missing_ok=True)
-    if keep_logs:
-        return
-    for stream in ("out", "err"):
-        log_path(name, stream).unlink(missing_ok=True)
-    watcher_log_path(name).unlink(missing_ok=True)
-
-
-def load_all_procs() -> dict[str, dict]:
-    """Load all process states."""
-    procs = {}
-    for pf in sorted(PROCS_DIR.glob("*.json")):
-        try:
-            info = json.loads(pf.read_text())
-            procs[info.get("name", pf.stem)] = info
-        except (json.JSONDecodeError, OSError):
-            continue
-    return procs
-
-
-# --- Utilities ---
-
-
-def _is_zombie(pid: int) -> bool:
-    """Return True if pid is a zombie/defunct process. Platform-aware."""
-    if sys.platform.startswith("linux"):
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read()
-            # stat format: pid (comm) state ...  comm may contain spaces/parens.
-            rparen = stat.rfind(")")
-            if rparen != -1:
-                state = stat[rparen + 2 : rparen + 3]
-                return state == "Z"
-        except (OSError, IndexError):
-            return False
-        return False
-    if sys.platform == "darwin":
-        try:
-            result = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "stat=", ],
-                capture_output=True, text=True, timeout=2,
-            )
-            if result.returncode == 0:
-                state = result.stdout.strip()
-                # macOS ps stat: 'Z' is zombie; may be prefixed with flags
-                return state.startswith("Z")
-        except (subprocess.SubprocessError, OSError):
-            return False
-    return False
-
-
-def is_running(pid: int | None) -> bool:
-    """Return True if pid is alive AND not a zombie/defunct process."""
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, OSError):
-        return False
-    return not _is_zombie(pid)
-
-
-_BLANK_PINFO = {"cpu": "-", "mem": "-", "time": "-"}
-
-
-def get_process_info(pid: int) -> dict:
-    """Get CPU/MEM/uptime for a single pid via ps. Prefer batch lookup."""
-    return get_process_info_batch([pid]).get(pid, dict(_BLANK_PINFO))
-
-
-def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
-    """Single ps call for many pids. Returns {pid: {cpu, mem, time}}."""
-    result_map: dict[int, dict] = {}
-    if not pids:
-        return result_map
-    # ps -p accepts comma-separated pids on both Linux and macOS.
-    pid_arg = ",".join(str(p) for p in pids)
-    try:
-        result = subprocess.run(
-            ["ps", "-p", pid_arg, "-o", "pid,%cpu,%mem,etime", "--no-headers"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                parts = line.split(None, 3)
-                if len(parts) >= 4:
-                    try:
-                        result_map[int(parts[0])] = {
-                            "cpu": parts[1], "mem": parts[2], "time": parts[3],
-                        }
-                    except ValueError:
-                        continue
-    except (subprocess.SubprocessError, OSError):
-        pass
-    # Fill misses with blanks
-    for p in pids:
-        result_map.setdefault(p, dict(_BLANK_PINFO))
-    return result_map
-
-
-def _looks_like_command(arg: str) -> bool:
-    """Check if an argument looks like an executable command (not a plain name).
-    Returns True if the arg is a path, has an extension, or resolves via which."""
-    if os.sep in arg or arg.startswith("./"):
-        return True
-    if "." in arg:
-        return True
-    if shutil.which(arg):
-        return True
-    return False
-
-
-def derive_name(cmd: list[str]) -> str:
-    """Derive a process name from the command."""
-    base = os.path.basename(cmd[0])
-    for ext in (".py", ".sh", ".js", ".ts", ".rb", ".pl", ".exe"):
-        if base.endswith(ext):
-            base = base[: -len(ext)]
-    return base
-
-
-def resolve_command(cmd: list[str]) -> list[str]:
-    """Resolve command to full path if possible."""
-    binary = shutil.which(cmd[0])
-    if binary:
-        cmd = cmd[:]
-        cmd[0] = binary
-    return cmd
-
-
-def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
-    """Kill a process (and its entire process group). Returns True if dead."""
-    sig = signal.SIGKILL if force else signal.SIGTERM
-
-    try:
-        if pgid:
-            os.killpg(pgid, sig)
-        else:
-            os.kill(pid, sig)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        print(f"{color('red', '❌')} Permission denied killing PID {pid}")
-        return False
-
-    # Wait for termination
-    for _ in range(50):  # 5 seconds
-        if not is_running(pid):
-            return True
-        time.sleep(0.1)
-
-    # Escalate to SIGKILL if SIGTERM didn't work
-    if not force and is_running(pid):
-        try:
-            if pgid:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                os.kill(pid, signal.SIGKILL)
-            time.sleep(0.3)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    return not is_running(pid)
-
-
-# --- Watch helpers ---
-
-
-WATCH_DEFAULTS = {
-    "interval": 3,
-    "min_uptime": 2,
-    "on_fast_crash": "backoff",  # backoff | stop | retry
-}
-BACKOFF_SCHEDULE = [2, 4, 8]
-TAIL_BYTES = 2048
-
-
-def _resolve_watch_block(
-    want_watch: bool,
-    overrides: dict | None,
-    prior_watch: dict | None,
-) -> dict | None:
-    """Decide what watch block a (re)starting proc should have.
-
-    Three paths, in priority order:
-      1. want_watch=True  -> fresh default block, optionally with overrides
-      2. prior_watch enabled (internal restart path) -> carry forward,
-         clear runtime fields (watcher_pid, errored, error_reason,
-         last_stderr_tail) but PRESERVE restart counters
-      3. otherwise -> None (no watch)
-
-    Pure: no side effects. Returns a new dict in all non-None cases.
-    """
-    if want_watch:
-        return _default_watch_config(overrides)
-    if prior_watch and prior_watch.get("enabled"):
-        carried = dict(prior_watch)
-        carried["watcher_pid"] = None
-        carried["watcher_pgid"] = None
-        carried["errored"] = False
-        carried["error_reason"] = None
-        carried["last_stderr_tail"] = None
-        return carried
-    return None
-
-
-def _default_watch_config(overrides: dict | None = None) -> dict:
-    """Build a fresh watch config block with defaults."""
-    cfg = {
-        "enabled": True,
-        "interval": WATCH_DEFAULTS["interval"],
-        "min_uptime": WATCH_DEFAULTS["min_uptime"],
-        "on_fast_crash": WATCH_DEFAULTS["on_fast_crash"],
-        "watcher_pid": None,
-        "watcher_pgid": None,
-        "restarts": 0,
-        "last_restart_at": None,
-        "errored": False,
-        "error_reason": None,
-        "last_stderr_tail": None,
-    }
-    if overrides:
-        for k, v in overrides.items():
-            if v is not None and k in cfg:
-                cfg[k] = v
-    return cfg
-
-
-def _spawn_watcher(name: str) -> tuple[int | None, int | None]:
-    """Detach a watcher process for `name`. Returns (pid, pgid)."""
-    try:
-        wlog = open(watcher_log_path(name), "a")
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "__watcher__", name],
-            stdout=wlog,
-            stderr=wlog,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        wlog.close()
-    except Exception as e:
-        watcher_log(name, f"failed to spawn watcher: {e}")
-        return None, None
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = None
-    return proc.pid, pgid
-
-
-def _kill_watcher(info: dict) -> None:
-    """Kill the watcher associated with `info` (if any), in-place clears pids."""
-    w = info.get("watch") or {}
-    wpid = w.get("watcher_pid")
-    wpgid = w.get("watcher_pgid")
-    if wpid and is_running(wpid):
-        kill_process(wpid, wpgid)
-    if "watch" in info:
-        info["watch"]["watcher_pid"] = None
-        info["watch"]["watcher_pgid"] = None
-
-
-def _tail_stderr(name: str, nbytes: int = TAIL_BYTES) -> str:
-    """Return last nbytes of stderr log, stripped."""
-    lf = log_path(name, "err")
-    if not lf.exists():
-        return ""
-    try:
-        with open(lf, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - nbytes))
-            data = f.read().decode("utf-8", errors="replace")
-        # strip leading partial line
-        if size > nbytes and "\n" in data:
-            data = data[data.index("\n") + 1:]
-        return data.strip()
-    except OSError:
-        return ""
-
-
-def _restart_proc_inplace(info: dict) -> tuple[int | None, int | None, str | None]:
-    """Spawn target command again, return (pid, pgid, err_msg)."""
-    name = info["name"]
-    command = info["command"]
-    cwd = info.get("cwd") or os.getcwd()
-    stdout_log = log_path(name, "out")
-    stderr_log = log_path(name, "err")
-    try:
-        out_f = open(stdout_log, "a")
-        err_f = open(stderr_log, "a")
-        ts = datetime.now().isoformat()
-        marker = f"\n=== [{ts}] [watch restart] {' '.join(command)} ===\n"
-        out_f.write(marker)
-        err_f.write(marker)
-        out_f.flush()
-        err_f.flush()
-        proc = subprocess.Popen(
-            command,
-            stdout=out_f,
-            stderr=err_f,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=cwd,
-        )
-        out_f.close()
-        err_f.close()
-    except FileNotFoundError:
-        return None, None, f"command not found: {command[0]}"
-    except PermissionError:
-        return None, None, f"permission denied: {command[0]}"
-    except Exception as e:
-        return None, None, f"failed to start: {e}"
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = None
-    return proc.pid, pgid, None
-
-
-def cmd_watcher_loop(name: str) -> int:
-    """Internal: watcher loop entry point. Invoked as `bgo __watcher__ <name>`."""
-    # Auto-reap children so dead procs disappear instead of lingering as zombies
-    try:
-        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-    except (ValueError, OSError):
-        pass
-
-    info = load_proc(name)
-    if not info or not info.get("watch", {}).get("enabled"):
-        return 0
-
-    watcher_log(name, f"watcher started for pid={info.get('pid')}")
-    backoff_idx = 0
-    current_started_at = info.get("started_at")
-    needs_early_check = True
-
-    def _start_epoch() -> float:
-        try:
-            s = current_started_at.replace("Z", "+00:00")
-            return datetime.fromisoformat(s).timestamp()
-        except Exception:
-            return time.time()
-
-    while True:
-        interval = info.get("watch", {}).get("interval", WATCH_DEFAULTS["interval"])
-        min_uptime_cfg = info.get("watch", {}).get("min_uptime", WATCH_DEFAULTS["min_uptime"])
-
-        if needs_early_check:
-            # High-frequency poll during the min_uptime window so fast-crashes
-            # are caught with accurate short uptime readings (even when the
-            # routine poll interval is larger than min_uptime).
-            deadline = _start_epoch() + min_uptime_cfg
-            died_early = False
-            while time.time() < deadline:
-                time.sleep(0.2)
-                cur_pid = info.get("pid")
-                if not is_running(cur_pid):
-                    died_early = True
-                    break
-            needs_early_check = False
-            if not died_early:
-                # Sleep the remainder of the normal interval
-                remaining = max(0.0, (_start_epoch() + min_uptime_cfg + interval) - time.time())
-                if remaining > 0:
-                    time.sleep(min(remaining, interval))
-        else:
-            time.sleep(max(1, interval))
-
-        info = load_proc(name)
-        if not info:
-            watcher_log(name, "proc state vanished; exiting")
-            return 0
-        w = info.get("watch") or {}
-        if not w.get("enabled"):
-            watcher_log(name, "watch disabled; exiting")
-            return 0
-        if info.get("status") == "stopped":
-            watcher_log(name, "proc manually stopped; exiting")
-            return 0
-
-        pid = info.get("pid")
-        if is_running(pid):
-            continue
-
-        # Process died. Compute uptime.
-        try:
-            started = datetime.fromisoformat(current_started_at.replace("Z", "+00:00"))
-            uptime = (datetime.now(timezone.utc) - started).total_seconds()
-        except Exception:
-            uptime = 0.0
-
-        min_uptime = w.get("min_uptime", WATCH_DEFAULTS["min_uptime"])
-        mode = w.get("on_fast_crash", WATCH_DEFAULTS["on_fast_crash"])
-        fast = uptime < min_uptime
-
-        if fast:
-            tail = _tail_stderr(name)
-            watcher_log(name, f"fast-crash: uptime={uptime:.2f}s mode={mode}")
-
-            if mode == "stop":
-                info["watch"]["errored"] = True
-                info["watch"]["error_reason"] = f"fast-crash (uptime {uptime:.2f}s, mode=stop)"
-                info["watch"]["last_stderr_tail"] = tail
-                info["watch"]["watcher_pid"] = None
-                info["watch"]["watcher_pgid"] = None
-                info["status"] = "stopped"
-                save_proc(name, info)
-                watcher_log(name, "errored; exiting")
-                return 0
-
-            if mode == "backoff":
-                if backoff_idx >= len(BACKOFF_SCHEDULE):
-                    info["watch"]["errored"] = True
-                    info["watch"]["error_reason"] = f"{len(BACKOFF_SCHEDULE) + 1} consecutive fast-crashes"
-                    info["watch"]["last_stderr_tail"] = tail
-                    info["watch"]["watcher_pid"] = None
-                    info["watch"]["watcher_pgid"] = None
-                    info["status"] = "stopped"
-                    save_proc(name, info)
-                    watcher_log(name, "backoff exhausted; errored; exiting")
-                    return 0
-                wait = BACKOFF_SCHEDULE[backoff_idx]
-                watcher_log(name, f"backoff sleep {wait}s (step {backoff_idx + 1}/{len(BACKOFF_SCHEDULE)})")
-                time.sleep(wait)
-                backoff_idx += 1
-            elif mode == "retry":
-                wait = BACKOFF_SCHEDULE[min(backoff_idx, len(BACKOFF_SCHEDULE) - 1)]
-                watcher_log(name, f"retry mode: sleep {wait}s")
-                time.sleep(wait)
-                backoff_idx = min(backoff_idx + 1, len(BACKOFF_SCHEDULE) - 1)
-        else:
-            backoff_idx = 0
-
-        # Reload (state may have shifted during sleep)
-        info = load_proc(name)
-        if not info or info.get("status") == "stopped" or not info.get("watch", {}).get("enabled"):
-            watcher_log(name, "state changed during backoff; exiting")
-            return 0
-
-        new_pid, new_pgid, err = _restart_proc_inplace(info)
-        if err:
-            watcher_log(name, f"restart failed: {err}")
-            info["watch"]["errored"] = True
-            info["watch"]["error_reason"] = err
-            info["watch"]["last_stderr_tail"] = _tail_stderr(name)
-            info["watch"]["watcher_pid"] = None
-            info["watch"]["watcher_pgid"] = None
-            info["status"] = "stopped"
-            save_proc(name, info)
-            return 0
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        info["pid"] = new_pid
-        info["pgid"] = new_pgid
-        info["started_at"] = now_iso
-        info["status"] = "running"
-        info["watch"]["restarts"] = info["watch"].get("restarts", 0) + 1
-        info["watch"]["last_restart_at"] = now_iso
-        save_proc(name, info)
-        current_started_at = now_iso
-        needs_early_check = True
-        watcher_log(name, f"restart #{info['watch']['restarts']} pid={new_pid} (prev uptime {uptime:.2f}s)")
+# Proc state files + log paths live in bgo_cli._state. Re-export so the
+# script's own namespace keeps the historical bindings; the test fixture
+# also patches the source module to keep them in sync.
+from bgo_cli._state import (  # noqa: E402
+    BGO_DIR,
+    PROCS_DIR,
+    LOGS_DIR,
+    init_dirs,
+    proc_file,
+    log_path,
+    watcher_log_path,
+    watcher_log,
+    load_proc,
+    save_proc,
+    delete_proc,
+    load_all_procs,
+)
+
+# Terminal capability detection, ANSI colors, and glyph sets all live
+# in bgo_cli._term — see that module for the resolution cascade. We
+# re-bind every public symbol into the script's namespace so the test
+# fixture (which loads this file as a module) and any external scripts
+# importing from the bare ``bgo`` path keep working unchanged.
+from bgo_cli._term import (  # noqa: E402 — module-level import after constants is fine
+    COLORS,
+    ANSI_RE,
+    color,
+    strip_ansi,
+    truncate,
+    LEVEL_PLAIN,
+    LEVEL_NORMAL,
+    LEVEL_FANCY,
+    _detect_table_level,
+    GLYPHS,
+    glyphs,
+)
+
+
+# Process inspection + lifecycle helpers live in bgo_cli._proc.
+from bgo_cli._proc import (  # noqa: E402
+    _is_zombie,
+    is_running,
+    _BLANK_PINFO,
+    get_process_info,
+    get_process_info_batch,
+    _looks_like_command,
+    derive_name,
+    resolve_command,
+    kill_process,
+)
+
+
+# Watcher loop + watch-config helpers live in bgo_cli._watcher.
+from bgo_cli._watcher import (  # noqa: E402
+    WATCH_DEFAULTS,
+    BACKOFF_SCHEDULE,
+    TAIL_BYTES,
+    _notify_errored,
+    _resolve_watch_block,
+    _default_watch_config,
+    _spawn_watcher,
+    _kill_watcher,
+    _tail_stderr,
+    _restart_proc_inplace,
+    cmd_watcher_loop,
+)
 
 
 # --- Commands ---
 
 
-def cmd_start(args):
-    """Start a process in the background."""
+def cmd_start(args: argparse.Namespace) -> int:
+    """Start a process in the background.
+
+    Reads the command from ``args.cmd`` (REMAINDER form) or
+    ``args.command`` (programmatic call). Refuses to overwrite a
+    proc that's already running under the same name. Writes the
+    initial state, spawns the watcher if requested, prints a brief
+    confirmation line plus log-path hint.
+
+    :returns: 0 on success, 1 on any failure (no command supplied,
+              duplicate name, FileNotFoundError, etc).
+    """
     init_dirs()
 
     name = args.name
@@ -788,8 +219,17 @@ def cmd_start(args):
     return 0
 
 
-def cmd_stop(args):
-    """Stop a running process."""
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop a running process.
+
+    Marks the state as stopped BEFORE issuing the kill so a watching
+    sidecar sees the flag and exits without trying to restart. Kills
+    the watcher first, then the target, escalating to SIGKILL on
+    timeout unless ``--force`` was passed (which goes straight to it).
+
+    :returns: 0 if the process is stopped (or was already), 1 on
+              kill failure.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -831,8 +271,16 @@ def cmd_stop(args):
     return 0
 
 
-def cmd_restart(args):
-    """Restart a process. Clears errored state and re-spawns watcher if enabled."""
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Restart a process; clears errored state and re-spawns the watcher.
+
+    Restart counters are preserved by default so chronic crashers stay
+    visible across manual restarts. Pass ``--reset-counters`` to wipe
+    the count to zero explicitly. The watcher (if any) is killed
+    before the target so it doesn't observe the death and race us.
+
+    :returns: ``cmd_start``'s return code (0 on success, 1 otherwise).
+    """
     name = args.name
     info = load_proc(name)
 
@@ -872,8 +320,17 @@ def cmd_restart(args):
     return cmd_start(restart_args)
 
 
-def cmd_watch(args):
-    """Attach a watcher to an existing process (or replace its config)."""
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Attach a watcher to an existing running process.
+
+    If ``--reset`` is set OR the proc has no prior watch block, a
+    fresh default config is built from overrides. Otherwise the
+    prior config is carried forward with overrides merged in,
+    errored fields cleared, and ``enabled=True`` re-asserted.
+
+    :returns: 0 on success, 1 if the proc is unknown / not running
+              / the watcher failed to spawn.
+    """
     name = args.name
     info = load_proc(name)
     if not info:
@@ -927,8 +384,11 @@ def cmd_watch(args):
     return 0
 
 
-def cmd_unwatch(args):
-    """Detach watcher from a process (keeps the process running)."""
+def cmd_unwatch(args: argparse.Namespace) -> int:
+    """Detach the watcher from a process. The target keeps running.
+
+    :returns: 0 always (no-op when nothing is being watched).
+    """
     name = args.name
     info = load_proc(name)
     if not info:
@@ -958,8 +418,8 @@ def _watch_cell(info: dict, level: str | None = None) -> str:
     return color("green", f"{g['watching']} {w.get('restarts', 0)}")
 
 
-def _clear_screen():
-    """ANSI clear-screen + home cursor. TTY safe."""
+def _clear_screen() -> None:
+    """Clear the terminal and home the cursor. TTY-only; no-op otherwise."""
     if sys.stdout.isatty():
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
@@ -1018,8 +478,15 @@ def _pad(text: str, width: int, align: str = "left") -> str:
     return text + " " * pad
 
 
-def _print_status_table(rows: list[dict], level: str | None = None):
-    """Render the status table for a snapshot."""
+def _print_status_table(rows: list[dict], level: str | None = None) -> None:
+    """Render the status table for a snapshot at the given rendering level.
+
+    Columns: NAME / STATUS / PID / CPU / MEM / UPTIME / WATCH /
+    COMMAND. The COMMAND column flexes to fill the terminal width;
+    the rest have fixed widths sized to fit their longest expected
+    value. Fancy mode draws Unicode box-drawing borders around the
+    table; normal mode prints ASCII rules instead.
+    """
     if not rows:
         return
     level = level or _detect_table_level()
@@ -1127,8 +594,19 @@ def _level_from_args(args) -> str | None:
     return None
 
 
-def cmd_status(args):
-    """Show status of all processes."""
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show status of all processes (or detail for one).
+
+    Modes (mutually exclusive, evaluated in order):
+
+    1. ``--json``        — emit JSON for ``args.name`` or all procs.
+    2. ``-w`` / ``--watch`` — full-screen auto-refresh until Ctrl-C.
+    3. ``args.name`` set  — detailed single-proc view.
+    4. default           — one-shot table for every registered proc.
+
+    :returns: 0 on success, 1 if ``--json`` was requested for a
+              specific name that doesn't exist.
+    """
     # JSON output mode bypasses everything else
     if getattr(args, "json", False):
         procs = load_all_procs()
@@ -1189,8 +667,13 @@ def cmd_status(args):
     return 0
 
 
-def _print_proc_detail(info: dict):
-    """Print detailed info for a single process."""
+def _print_proc_detail(info: dict) -> None:
+    """Print the detail card for a single process state ``info`` dict.
+
+    Lists status / PID / command / cwd / start time / live CPU+MEM
+    (when running) / log sizes / watch config + restart counters /
+    errored reason + last stderr tail (when errored).
+    """
     pid = info["pid"]
     running = is_running(pid)
     status_str = color("green", "online") if running else color("red", "stopped")
@@ -1265,8 +748,17 @@ def _human_size(n: int) -> str:
     return f"{n:.1f}TB"
 
 
-def cmd_logs(args):
-    """Show logs for a process."""
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Show logs for a process.
+
+    Stream selection: ``--watcher`` -> watcher event log;
+    ``--stderr`` -> stderr; ``--stdout`` (or default) -> stdout.
+    With ``--follow`` / ``-f``, exec ``tail -f`` for live streaming;
+    otherwise tail the last ``-n`` lines (default 50) and exit.
+
+    :returns: 0 on success, 1 if the proc is unknown or the log
+              file disappeared between stat and open.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -1357,16 +849,16 @@ def cmd_logs(args):
     return 0
 
 
-def cmd_logs_follow(args):
-    """Follow logs for a process (shorthand for logs -f)."""
+def cmd_logs_follow(args: argparse.Namespace) -> int:
+    """Follow logs for a process. Shorthand for ``bgo logs <name> -f``."""
     args.follow = True
     if not hasattr(args, "lines") or args.lines is None:
         args.lines = 10
     return cmd_logs(args)
 
 
-def cmd_clean(args):
-    """Remove stopped processes from state."""
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Drop every stopped proc from state (keeps log files in place)."""
     procs = load_all_procs()
     cleaned = []
 
@@ -1386,8 +878,16 @@ def cmd_clean(args):
     return 0
 
 
-def cmd_resurrect(args):
-    """Restart all processes that were running before shutdown/reboot."""
+def cmd_resurrect(args: argparse.Namespace) -> int:
+    """Restart every proc whose last recorded status was ``running``.
+
+    Used by the systemd / launchd autostart entry to bring back
+    managed procs after a reboot or session login. Procs that the
+    user manually stopped (status=stopped) are left alone.
+
+    :returns: 0 if all candidates restarted (or none existed), 1 if
+              any failed to start.
+    """
     procs = load_all_procs()
 
     if not procs:
@@ -1532,7 +1032,7 @@ def _restart_one(name: str, info: dict) -> int:
     return cmd_start(restart_args)
 
 
-def cmd_restart_stopped(args):
+def cmd_restart_stopped(args: argparse.Namespace) -> int:
     """Restart procs that are not currently running.
 
     Includes both explicitly stopped procs AND procs whose state says
@@ -1607,7 +1107,7 @@ def cmd_restart_stopped(args):
     return 0
 
 
-def cmd_restart_last(args):
+def cmd_restart_last(args: argparse.Namespace) -> int:
     """Restart processes ordered by most-recent-first.
 
     With --all: restart every not-running proc in most-recent order.
@@ -1671,8 +1171,14 @@ def cmd_restart_last(args):
     return 0
 
 
-def cmd_delete(args):
-    """Delete a process from state (stop if running first)."""
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Delete a process from state (stop it first if running).
+
+    Drops log files too unless ``--keep-logs`` is passed. Asks for
+    confirmation when stopping a running proc, unless ``-y``.
+
+    :returns: 0 on success, 1 if the proc is unknown.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -1697,10 +1203,118 @@ def cmd_delete(args):
     return 0
 
 
+# --- Optional feature handlers ---
+
+
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Install / uninstall / inspect login autostart for ``bgo resurrect``.
+
+    Subcommands (``args.action``):
+        install   — write the unit and enable it.
+        uninstall — disable and remove the unit.
+        status    — print install state as table or JSON.
+
+    The ``--tray`` flag pivots all three actions to the tray entry
+    instead of the resurrect entry. Both can be installed; they're
+    independent.
+    """
+    try:
+        from bgo_cli import _autostart
+    except ImportError as exc:
+        print(f"{color('red', '❌')} autostart module unavailable: {exc}")
+        return 1
+
+    target = "tray" if getattr(args, "tray", False) else "resurrect"
+    action = args.action
+
+    if action == "status":
+        s = _autostart.status()
+        tray_only = getattr(args, "tray", False)
+        if getattr(args, "json", False):
+            if tray_only:
+                print(json.dumps({
+                    "backend": s.get("backend"),
+                    "tray": s.get("tray"),
+                    "tray_path": s.get("tray_path"),
+                }, indent=2))
+            else:
+                print(json.dumps(s, indent=2))
+            return 0
+        if s["backend"] is None:
+            print(f"{color('yellow', '⚠')}  autostart not supported on this platform")
+            return 1
+        print(f"backend:   {s['backend']}")
+        keys = ("tray",) if tray_only else ("resurrect", "tray")
+        for key in keys:
+            mark = color("green", "✓") if s[key] else color("gray", "·")
+            path = s.get(f"{key}_path") or "(not installed)"
+            print(f"{mark} {key:<10} {path}")
+        return 0
+
+    if action == "install":
+        ok, msg = _autostart.install(target)
+        if not ok:
+            print(f"{color('red', '❌')} install failed: {msg}")
+            return 1
+        print(f"{color('green', '✅')} installed {target} autostart at {msg}")
+        if target == "resurrect" and _autostart.detect_backend() == "systemd-user":
+            print(f"   {color('gray', 'hint: run')} "
+                  f"loginctl enable-linger $USER "
+                  f"{color('gray', 'to run before login')}")
+        return 0
+
+    if action == "uninstall":
+        ok, msg = _autostart.uninstall(target)
+        if not ok:
+            print(f"{color('red', '❌')} uninstall failed: {msg}")
+            return 1
+        print(f"{color('green', '✅')} uninstalled {target} autostart")
+        return 0
+
+    print(f"{color('red', '❌')} unknown autostart action: {action}")
+    return 1
+
+
+def cmd_tray(args: argparse.Namespace) -> int:
+    """Launch the system-tray icon (optional extra ``bgo-cli[tray]``).
+
+    If PySide6 is not importable, delegates to
+    ``_tray_install.ensure_installed`` which detects the install
+    context (uv tool / pipx / pip) and offers to inject the deps.
+    """
+    try:
+        from bgo_cli import _tray
+    except ImportError:
+        try:
+            from bgo_cli import _tray_install
+        except ImportError as exc:
+            print(f"{color('red', '❌')} tray module unavailable: {exc}")
+            return 1
+        ok = _tray_install.ensure_installed(
+            auto=getattr(args, "auto_install", False)
+            or os.environ.get("BGO_TRAY_AUTOINSTALL") == "1"
+        )
+        if not ok:
+            return 1
+        # Re-exec via the installed entrypoint so the freshly-injected
+        # deps are picked up by a clean interpreter. We prefer
+        # shutil.which("bgo") over sys.argv[0] because argv[0] may be
+        # the bare script path ("./bgo") or "python", neither of which
+        # have the new PySide6 on their import path after a uv/pipx
+        # injection completed. Pass the original argv[1:] through so
+        # flags like --poll survive the re-exec.
+        bgo_bin = shutil.which("bgo") or sys.argv[0]
+        os.execvp(bgo_bin, [bgo_bin, *sys.argv[1:]])
+        return 0  # unreachable
+
+    return _tray.run(poll_seconds=getattr(args, "poll", None))
+
+
 # --- CLI ---
 
 
-def main():
+def main() -> int:
+    """Entry point. Returns the process exit code for ``sys.exit``."""
     init_dirs()
 
     # Hidden subcommand for internal watcher loop
@@ -1710,7 +1324,7 @@ def main():
     known_commands = {
         "start", "stop", "restart", "restart-stopped", "restart-last",
         "status", "logs", "clean", "delete", "resurrect",
-        "watch", "unwatch",
+        "watch", "unwatch", "autostart", "tray",
         "ls", "list", "follow", "tail", "-h", "--help",
         "open", "kill", "rm",
     }
@@ -2001,6 +1615,42 @@ Watch mode (auto-restart on crash):
         help="Preserve out/err/watcher log files after delete",
     )
 
+    # autostart
+    autostart_parser = subparsers.add_parser(
+        "autostart",
+        help="Install login autostart for `bgo resurrect` (and optionally tray)",
+    )
+    autostart_sub = autostart_parser.add_subparsers(
+        dest="action", required=True, help="Autostart action"
+    )
+    for act in ("install", "uninstall"):
+        sp = autostart_sub.add_parser(act, help=f"{act} the autostart entry")
+        sp.add_argument(
+            "--tray", action="store_true",
+            help="Target the tray autostart entry instead of resurrect",
+        )
+    sp_status = autostart_sub.add_parser("status", help="Show install state")
+    sp_status.add_argument(
+        "--tray", action="store_true",
+        help="Show status for the tray entry only (default: both)",
+    )
+    sp_status.add_argument(
+        "--json", action="store_true", help="Machine-readable output",
+    )
+
+    # tray (optional extra)
+    tray_parser = subparsers.add_parser(
+        "tray", help="Launch the system-tray icon (requires bgo-cli[tray])"
+    )
+    tray_parser.add_argument(
+        "--poll", type=int, default=None,
+        help="State poll interval in seconds (default: 3 or $BGO_TRAY_POLL)",
+    )
+    tray_parser.add_argument(
+        "--auto-install", dest="auto_install", action="store_true",
+        help="Install PySide6 without confirmation if missing",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2027,6 +1677,8 @@ Watch mode (auto-restart on crash):
         "rm": cmd_delete,
         "watch": cmd_watch,
         "unwatch": cmd_unwatch,
+        "autostart": cmd_autostart,
+        "tray": cmd_tray,
     }
 
     handler = handlers.get(args.command)

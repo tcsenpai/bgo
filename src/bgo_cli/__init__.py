@@ -12,6 +12,7 @@ need to mirror the script.
 """
 
 from pathlib import Path
+import importlib.machinery
 import importlib.util
 import sys
 

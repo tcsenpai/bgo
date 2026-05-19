@@ -46,6 +46,9 @@ dev = [
     "build>=1.0",
     "twine>=4.0",
 ]
+tray = [
+    "PySide6>=6.6",
+]
 
 [project.scripts]
 bgo = "bgo_cli:main"
