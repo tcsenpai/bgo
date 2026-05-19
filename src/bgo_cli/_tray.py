@@ -231,21 +231,50 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs pystray
 
     quit_flag = {"stop": False}
 
+    # pystray's MenuItem inspects the action's argspec and rejects
+    # callables with more than the (icon, item) positional pair. Using
+    # ``lambda _icon, _it, n=name: ...`` to bind loop variables fools
+    # the introspector, so we use proper closure factories instead.
+    def bgo_action(*args: str):
+        """Return a 2-arg callable that runs ``bgo <args>``."""
+        def _action(_icon, _item):  # noqa: ANN001 — pystray contract
+            run_bgo(*args)
+        return _action
+
+    def open_logs_action(name: str):
+        """Return a 2-arg callable that opens ``name``'s log."""
+        def _action(_icon, _item):  # noqa: ANN001
+            _open_logs(name)
+        return _action
+
+    def refresh_action():
+        """Return a 2-arg callable that rebuilds the menu in place."""
+        def _action(icon, _item):  # noqa: ANN001
+            icon.menu = build_menu()
+            icon.update_menu()
+        return _action
+
+    def quit_action():
+        """Return a 2-arg callable that signals the poller and stops."""
+        def _action(icon, _item):  # noqa: ANN001
+            quit_flag["stop"] = True
+            icon.stop()
+        return _action
+
     def make_proc_submenu(snap: ProcSnapshot) -> Menu:
         # ``bgo start <name>`` without a command argument is rejected
         # by the core CLI (start requires REMAINDER). For a known
         # registered proc the correct re-spawn is ``bgo restart``,
         # which preserves the stored command. We surface "Restart"
-        # for online procs and "Start" (which shells out to restart
-        # under the hood) for stopped ones — both routes hit the
-        # same code path, but the labels match user expectations.
+        # for online procs and "Start" for stopped ones — both labels
+        # route to the same ``bgo restart`` underneath.
         is_running = snap.status == "running" and not snap.errored
         primary_label = "Restart" if is_running else "Start"
         return Menu(
-            Item(primary_label, lambda _icon, _it, n=snap.name: run_bgo("restart", n)),
-            Item("Stop",        lambda _icon, _it, n=snap.name: run_bgo("stop", n)),
+            Item(primary_label, bgo_action("restart", snap.name)),
+            Item("Stop",        bgo_action("stop", snap.name)),
             Menu.SEPARATOR,
-            Item("Open logs", lambda _icon, _it, n=snap.name: _open_logs(n)),
+            Item("Open logs",   open_logs_action(snap.name)),
         )
 
     def build_menu() -> Menu:
@@ -257,16 +286,11 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs pystray
         items.append(Menu.SEPARATOR)
         for label, cmd in spec.actions:
             if cmd == "__quit__":
-                def _quit(icon, _item):  # noqa: ANN001
-                    quit_flag["stop"] = True
-                    icon.stop()
-                items.append(Item(label, _quit))
+                items.append(Item(label, quit_action()))
             elif cmd == "__refresh__":
-                items.append(Item(label, lambda icon, _it: icon.update_menu()))
+                items.append(Item(label, refresh_action()))
             else:
-                items.append(
-                    Item(label, lambda _icon, _it, c=cmd: run_bgo(c))
-                )
+                items.append(Item(label, bgo_action(cmd)))
         return Menu(*items)
 
     icon = pystray.Icon(
