@@ -46,6 +46,10 @@ dev = [
     "build>=1.0",
     "twine>=4.0",
 ]
+tray = [
+    "pystray>=0.19",
+    "Pillow>=10",
+]
 
 [project.scripts]
 bgo = "bgo_cli:main"

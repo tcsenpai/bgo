@@ -247,6 +247,84 @@ When a proc enters `errored`:
 | `--on-fast-crash MODE` | `backoff` | One of `backoff`, `stop`, `retry` |
 | `--reset` | off | `bgo watch` only — reset prior watch config to defaults |
 
+## Desktop notifications
+
+`bgo` fires a desktop notification when a watched process enters the
+`errored` state (fast-crash budget exhausted, restart failed, etc.).
+Zero new dependencies — it shells out to the platform's native
+notifier:
+
+- Linux: `notify-send` (libnotify; install via your distro).
+- macOS: built-in `osascript`. Falls back to `terminal-notifier` if
+  available.
+
+Notifications are best-effort — if no notifier is reachable, the
+watcher carries on silently.
+
+| Env var | Values | Default | Effect |
+|---|---|---|---|
+| `BGO_NOTIFY` | `off`, `errors`, `all` | `errors` | What to fire on |
+| `BGO_NOTIFY_CMD` | argv template with `{title}` / `{body}` | — | Override the backend entirely |
+
+## Autostart at login
+
+`bgo autostart` installs a per-user service that runs `bgo resurrect`
+on session start, restoring every process that was registered as
+`running` at shutdown. Backends are auto-detected:
+
+- Linux → systemd user unit at `~/.config/systemd/user/bgo-resurrect.service`
+- macOS → LaunchAgent at `~/Library/LaunchAgents/sh.discus.bgo.resurrect.plist`
+
+```bash
+bgo autostart install            # install resurrect at login
+bgo autostart install --tray     # also install the tray icon at login
+bgo autostart status             # show what's installed
+bgo autostart status --json      # machine-readable
+bgo autostart uninstall          # remove
+bgo autostart uninstall --tray   # remove tray entry only
+```
+
+On Linux, services only run after the user logs in. To start the
+resurrect unit before a graphical session exists (e.g. headless
+servers), enable lingering once: `loginctl enable-linger $USER`.
+Neither flag is set automatically — it modifies system state.
+
+## Tray icon (optional)
+
+`bgo tray` runs a system-tray icon that lists all registered procs
+and exposes Start / Stop / Restart / Open-logs actions for each. The
+menu refreshes from `~/.bgo/procs/*.json` every few seconds and
+shells out to `bgo` for every action, so behavior matches the CLI
+exactly.
+
+Tray UI needs `pystray` and `Pillow`. They're shipped as an optional
+extra to keep the core install zero-dep:
+
+```bash
+# uv (recommended)
+uv tool install bgo-cli --with pystray --with Pillow
+
+# pipx
+pipx install bgo-cli
+pipx inject bgo-cli pystray Pillow
+
+# pip
+pip install 'bgo-cli[tray]'
+```
+
+If you forget, the first run of `bgo tray` detects your installer
+(uv tool / pipx / pip) and offers to inject the deps for you. Skip
+the confirmation with `--auto-install` or `BGO_TRAY_AUTOINSTALL=1`.
+
+| Flag / env | Default | Effect |
+|---|---|---|
+| `--poll N`, `BGO_TRAY_POLL` | `3` | Snapshot refresh interval (seconds) |
+| `--auto-install`, `BGO_TRAY_AUTOINSTALL=1` | off | Skip the install prompt |
+
+Wayland support depends on your compositor — GNOME needs the
+"AppIndicator" extension; KDE and most wlroots compositors work out
+of the box.
+
 ## Storage
 
 - State: `~/.bgo/procs/<name>.json` — one file per process, written atomically (tmp + `os.replace`)
