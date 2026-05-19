@@ -97,15 +97,19 @@ def _load_one(path: Path) -> ProcSnapshot | None:
 
 
 def load_snapshots(procs_dir: Path = PROCS_DIR) -> list[ProcSnapshot]:
-    """Load every proc state file as a snapshot, sorted by name."""
+    """Load every proc state file as a snapshot, sorted by ``name``.
+
+    Sort happens after parsing so the order follows the proc's stored
+    ``name`` field (which may differ from the on-disk filename).
+    """
     if not procs_dir.exists():
         return []
     out: list[ProcSnapshot] = []
-    for pf in sorted(procs_dir.glob("*.json")):
+    for pf in procs_dir.glob("*.json"):
         snap = _load_one(pf)
         if snap is not None:
             out.append(snap)
-    return out
+    return sorted(out, key=lambda s: s.name)
 
 
 # --- Menu construction ---------------------------------------------------
@@ -281,7 +285,14 @@ def _open_logs_darwin(follow_cmd: list[str]) -> None:
     """
     import shlex
 
+    # Shell-quote each arg so the spawned terminal's shell parses the
+    # command back into argv correctly.
     quoted = " ".join(shlex.quote(arg) for arg in follow_cmd)
+    # Then escape the result for the AppleScript string layer: any
+    # backslashes or double quotes inside `quoted` (e.g. from paths
+    # containing them) would otherwise terminate the AppleScript
+    # literal early or smuggle in extra AppleScript tokens.
+    quoted = quoted.replace("\\", "\\\\").replace('"', '\\"')
     override = (os.environ.get("BGO_TERMINAL") or "").strip().lower()
     use_iterm = override in ("iterm", "iterm2")
 
