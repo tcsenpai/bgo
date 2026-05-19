@@ -18,6 +18,24 @@ import tty
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _notify_errored(name: str, reason: str) -> None:
+    """Best-effort desktop notification on errored transition.
+
+    Lazy-imports the optional ``bgo_cli._notify`` module so the bare
+    ``bgo`` script keeps working even outside its installed package
+    context. Any failure is swallowed — notifications must never break
+    the watcher loop.
+    """
+    try:
+        from bgo_cli._notify import notify
+    except ImportError:
+        return
+    try:
+        notify(f"bgo: {name} errored", reason, level="error")
+    except Exception:
+        pass
+
 # Config
 BGO_DIR = Path.home() / ".bgo"
 PROCS_DIR = BGO_DIR / "procs"
@@ -602,26 +620,30 @@ def cmd_watcher_loop(name: str) -> int:
             watcher_log(name, f"fast-crash: uptime={uptime:.2f}s mode={mode}")
 
             if mode == "stop":
+                reason = f"fast-crash (uptime {uptime:.2f}s, mode=stop)"
                 info["watch"]["errored"] = True
-                info["watch"]["error_reason"] = f"fast-crash (uptime {uptime:.2f}s, mode=stop)"
+                info["watch"]["error_reason"] = reason
                 info["watch"]["last_stderr_tail"] = tail
                 info["watch"]["watcher_pid"] = None
                 info["watch"]["watcher_pgid"] = None
                 info["status"] = "stopped"
                 save_proc(name, info)
                 watcher_log(name, "errored; exiting")
+                _notify_errored(name, reason)
                 return 0
 
             if mode == "backoff":
                 if backoff_idx >= len(BACKOFF_SCHEDULE):
+                    reason = f"{len(BACKOFF_SCHEDULE) + 1} consecutive fast-crashes"
                     info["watch"]["errored"] = True
-                    info["watch"]["error_reason"] = f"{len(BACKOFF_SCHEDULE) + 1} consecutive fast-crashes"
+                    info["watch"]["error_reason"] = reason
                     info["watch"]["last_stderr_tail"] = tail
                     info["watch"]["watcher_pid"] = None
                     info["watch"]["watcher_pgid"] = None
                     info["status"] = "stopped"
                     save_proc(name, info)
                     watcher_log(name, "backoff exhausted; errored; exiting")
+                    _notify_errored(name, reason)
                     return 0
                 wait = BACKOFF_SCHEDULE[backoff_idx]
                 watcher_log(name, f"backoff sleep {wait}s (step {backoff_idx + 1}/{len(BACKOFF_SCHEDULE)})")
@@ -651,6 +673,7 @@ def cmd_watcher_loop(name: str) -> int:
             info["watch"]["watcher_pgid"] = None
             info["status"] = "stopped"
             save_proc(name, info)
+            _notify_errored(name, err)
             return 0
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1697,6 +1720,98 @@ def cmd_delete(args):
     return 0
 
 
+# --- Optional feature handlers ---
+
+
+def cmd_autostart(args):
+    """Install / uninstall / inspect login autostart for ``bgo resurrect``.
+
+    Subcommands (``args.action``):
+        install   — write the unit and enable it.
+        uninstall — disable and remove the unit.
+        status    — print install state as table or JSON.
+
+    The ``--tray`` flag pivots all three actions to the tray entry
+    instead of the resurrect entry. Both can be installed; they're
+    independent.
+    """
+    try:
+        from bgo_cli import _autostart
+    except ImportError as exc:
+        print(f"{color('red', '❌')} autostart module unavailable: {exc}")
+        return 1
+
+    target = "tray" if getattr(args, "tray", False) else "resurrect"
+    action = args.action
+
+    if action == "status":
+        s = _autostart.status()
+        if getattr(args, "json", False):
+            print(json.dumps(s, indent=2))
+            return 0
+        if s["backend"] is None:
+            print(f"{color('yellow', '⚠')}  autostart not supported on this platform")
+            return 1
+        print(f"backend:   {s['backend']}")
+        for key in ("resurrect", "tray"):
+            mark = color("green", "✓") if s[key] else color("gray", "·")
+            path = s.get(f"{key}_path") or "(not installed)"
+            print(f"{mark} {key:<10} {path}")
+        return 0
+
+    if action == "install":
+        ok, msg = _autostart.install(target)
+        if not ok:
+            print(f"{color('red', '❌')} install failed: {msg}")
+            return 1
+        print(f"{color('green', '✅')} installed {target} autostart at {msg}")
+        if target == "resurrect" and _autostart.detect_backend() == "systemd-user":
+            print(f"   {color('gray', 'hint: run')} "
+                  f"loginctl enable-linger $USER "
+                  f"{color('gray', 'to run before login')}")
+        return 0
+
+    if action == "uninstall":
+        ok, msg = _autostart.uninstall(target)
+        if not ok:
+            print(f"{color('red', '❌')} uninstall failed: {msg}")
+            return 1
+        print(f"{color('green', '✅')} uninstalled {target} autostart")
+        return 0
+
+    print(f"{color('red', '❌')} unknown autostart action: {action}")
+    return 1
+
+
+def cmd_tray(args):
+    """Launch the system-tray icon (optional extra ``bgo-cli[tray]``).
+
+    If pystray/Pillow are not importable, delegates to
+    ``_tray_install.ensure_installed`` which detects the install
+    context (uv tool / pipx / pip) and offers to inject the deps.
+    """
+    try:
+        from bgo_cli import _tray
+    except ImportError:
+        try:
+            from bgo_cli import _tray_install
+        except ImportError as exc:
+            print(f"{color('red', '❌')} tray module unavailable: {exc}")
+            return 1
+        ok = _tray_install.ensure_installed(
+            auto=getattr(args, "auto_install", False)
+            or os.environ.get("BGO_TRAY_AUTOINSTALL") == "1"
+        )
+        if not ok:
+            return 1
+        # Re-exec self with the same args so the freshly-installed
+        # deps are picked up by a clean interpreter.
+        os.execvp(sys.argv[0], sys.argv)
+        return 0  # unreachable
+
+    return _tray.run(poll_seconds=getattr(args, "poll", None))
+
+
 # --- CLI ---
 
 
@@ -1710,7 +1825,7 @@ def main():
     known_commands = {
         "start", "stop", "restart", "restart-stopped", "restart-last",
         "status", "logs", "clean", "delete", "resurrect",
-        "watch", "unwatch",
+        "watch", "unwatch", "autostart", "tray",
         "ls", "list", "follow", "tail", "-h", "--help",
         "open", "kill", "rm",
     }
@@ -2001,6 +2116,38 @@ Watch mode (auto-restart on crash):
         help="Preserve out/err/watcher log files after delete",
     )
 
+    # autostart
+    autostart_parser = subparsers.add_parser(
+        "autostart",
+        help="Install login autostart for `bgo resurrect` (and optionally tray)",
+    )
+    autostart_sub = autostart_parser.add_subparsers(
+        dest="action", required=True, help="Autostart action"
+    )
+    for act in ("install", "uninstall"):
+        sp = autostart_sub.add_parser(act, help=f"{act} the autostart entry")
+        sp.add_argument(
+            "--tray", action="store_true",
+            help="Target the tray autostart entry instead of resurrect",
+        )
+    sp_status = autostart_sub.add_parser("status", help="Show install state")
+    sp_status.add_argument(
+        "--json", action="store_true", help="Machine-readable output",
+    )
+
+    # tray (optional extra)
+    tray_parser = subparsers.add_parser(
+        "tray", help="Launch the system-tray icon (requires bgo-cli[tray])"
+    )
+    tray_parser.add_argument(
+        "--poll", type=int, default=None,
+        help="State poll interval in seconds (default: 3 or $BGO_TRAY_POLL)",
+    )
+    tray_parser.add_argument(
+        "--auto-install", dest="auto_install", action="store_true",
+        help="Install pystray/Pillow without confirmation if missing",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -2027,6 +2174,8 @@ Watch mode (auto-restart on crash):
         "rm": cmd_delete,
         "watch": cmd_watch,
         "unwatch": cmd_unwatch,
+        "autostart": cmd_autostart,
+        "tray": cmd_tray,
     }
 
     handler = handlers.get(args.command)
