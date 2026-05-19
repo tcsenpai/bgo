@@ -15,6 +15,12 @@ PROJECT_INDEX.md
 # Hindsight migration markers
 .hindsight-migrate-declined
 
+# Mycelium project tracker (local-only)
+.mycelium/
+
+# uv lockfile (not tracked for applications-as-libraries)
+uv.lock
+
 # Python
 __pycache__/
 *.pyc
