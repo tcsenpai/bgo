@@ -47,9 +47,18 @@ def detect_installer() -> InstallerKind:
     Uses ``sys.prefix`` because every installer roots bgo's venv
     inside its own per-tool tree. We check the most specific markers
     first (``uv tool``, ``pipx``) and fall through to plain ``pip``.
+
+    The ``UV_TOOL_DIR`` env var is honored when set, so users who
+    have moved uv's tool root outside the default ``~/.local/share``
+    location are still detected.
     """
     prefix = (sys.prefix or "").replace("\\", "/")
     lower = prefix.lower()
+    uv_tool_dir = (os.environ.get("UV_TOOL_DIR") or "").strip()
+    if uv_tool_dir:
+        normalized = uv_tool_dir.replace("\\", "/").rstrip("/").lower()
+        if normalized and normalized in lower:
+            return "uv"
     if "/uv/tools/" in lower or "uv-tool" in lower:
         return "uv"
     if "/pipx/venvs/" in lower or "/pipx/" in lower:
@@ -103,6 +112,17 @@ def ensure_installed(auto: bool = False) -> bool:
     :param auto: Skip the y/N prompt and run the install command.
     :returns:    ``True`` once both deps import cleanly. ``False`` if
                  the user declined or the install command failed.
+
+    .. important::
+       For ``uv tool`` and ``pipx`` install contexts, a successful
+       return value indicates the dependencies were installed into the
+       *target* environment, **not** the current Python process.
+       The caller is responsible for re-execing the appropriate ``bgo``
+       binary (``shutil.which("bgo")``) so the new interpreter picks
+       up the freshly injected deps. ``cmd_tray`` in the root ``bgo``
+       script implements this re-exec. The plain ``pip`` path installs
+       into the current Python's user site and the caller can usually
+       continue in-process — but re-exec is still the safe default.
     """
     try:
         import pystray  # noqa: F401  (presence check only)

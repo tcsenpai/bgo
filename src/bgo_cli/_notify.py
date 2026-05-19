@@ -25,6 +25,7 @@ fire-and-forget without try/except.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -83,9 +84,16 @@ def _resolve_backend() -> tuple[str, Sequence[str]] | None:
     """
     override = (os.environ.get("BGO_NOTIFY_CMD") or "").strip()
     if override:
-        # Split lazily; user is responsible for sane quoting. We do not
-        # invoke a shell, so injection is bounded to argv only.
-        return "override", tuple(override.split())
+        # shlex.split respects shell-style quoting so the user can
+        # group arguments containing spaces. We do not invoke a shell
+        # at runtime, so injection is bounded to argv only.
+        try:
+            parts = shlex.split(override)
+        except ValueError:
+            # Unbalanced quotes etc. — fall through to platform detection.
+            parts = []
+        if parts:
+            return "override", tuple(parts)
 
     if sys.platform.startswith("linux"):
         if shutil.which("notify-send"):

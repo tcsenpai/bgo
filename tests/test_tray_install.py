@@ -33,7 +33,19 @@ def test_detect_installer_from_prefix(
 ) -> None:
     """The path pattern in ``sys.prefix`` selects the installer kind."""
     monkeypatch.setattr(_tray_install.sys, "prefix", prefix)
+    monkeypatch.delenv("UV_TOOL_DIR", raising=False)
     assert _tray_install.detect_installer() == expected
+
+
+def test_detect_installer_honors_uv_tool_dir_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom ``UV_TOOL_DIR`` location is detected as uv."""
+    monkeypatch.setenv("UV_TOOL_DIR", "/opt/custom/uv-tools")
+    monkeypatch.setattr(
+        _tray_install.sys, "prefix", "/opt/custom/uv-tools/bgo-cli"
+    )
+    assert _tray_install.detect_installer() == "uv"
 
 
 # --- _command_for --------------------------------------------------------

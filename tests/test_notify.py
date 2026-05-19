@@ -54,6 +54,27 @@ def test_resolve_backend_override_wins() -> None:
     assert argv == ("my-notifier", "{title}", "{body}")
 
 
+def test_resolve_backend_override_respects_quotes() -> None:
+    """Quoted args in ``$BGO_NOTIFY_CMD`` stay grouped."""
+    env = {"BGO_NOTIFY_CMD": '"/opt/bin/notify ng" --json {title}'}
+    with mock.patch.dict(_notify.os.environ, env, clear=False):
+        result = _notify._resolve_backend()
+    assert result is not None
+    kind, argv = result
+    assert kind == "override"
+    assert argv == ("/opt/bin/notify ng", "--json", "{title}")
+
+
+def test_resolve_backend_override_with_unbalanced_quotes_falls_through(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Malformed override is ignored; platform detection still runs."""
+    monkeypatch.setenv("BGO_NOTIFY_CMD", 'broken "quote')
+    monkeypatch.setattr(_notify.sys, "platform", "linux")
+    monkeypatch.setattr(_notify.shutil, "which", lambda _name: None)
+    assert _notify._resolve_backend() is None
+
+
 def test_resolve_backend_linux_notify_send() -> None:
     """On Linux, ``notify-send`` is picked when present."""
     with mock.patch.dict(_notify.os.environ, {}, clear=True), \

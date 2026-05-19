@@ -239,6 +239,45 @@ def test_uninstall_darwin_removes_plist(darwin_env: Path) -> None:
     assert not plist.exists()
 
 
+def test_launchctl_unload_falls_back_to_legacy(tmp_path: Path) -> None:
+    """``bootout`` failing triggers a ``unload -w`` retry."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[1] == "bootout":
+            return 1, "bootout: not supported"
+        return 0, ""  # unload succeeds
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, _ = _autostart._launchctl_unload(tmp_path / "x.plist")
+    assert ok is True
+    assert calls[0][1] == "bootout"
+    assert calls[1][1] == "unload"
+
+
+def test_launchctl_unload_treats_missing_agent_as_success(tmp_path: Path) -> None:
+    """``Could not find specified service`` is benign — idempotent uninstall."""
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        return 1, "Could not find specified service"
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart._launchctl_unload(tmp_path / "x.plist")
+    assert ok is True
+    assert msg == ""
+
+
+def test_launchctl_unload_surfaces_real_failure(tmp_path: Path) -> None:
+    """Both bootout and unload failing with unknown errors -> ok=False."""
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        return 1, "permission denied"
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart._launchctl_unload(tmp_path / "x.plist")
+    assert ok is False
+    assert "permission denied" in msg
+
+
 # --- status --------------------------------------------------------------
 
 

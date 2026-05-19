@@ -131,7 +131,10 @@ def _resolve_bgo_binary() -> str:
     """
     found = shutil.which("bgo")
     if found:
-        return found
+        # ``which`` already returns absolute paths on all supported
+        # platforms, but harden against PATH entries that contain
+        # ``..`` or are themselves relative (rare but legal).
+        return str(Path(found).resolve())
     # Fall back to the script that invoked us. resolve() collapses
     # symlinks; we want the absolute, canonical path.
     return str(Path(sys.argv[0]).resolve())
@@ -235,11 +238,33 @@ def _launchctl_load(plist: Path) -> tuple[bool, str]:
 
 
 def _launchctl_unload(plist: Path) -> tuple[bool, str]:
-    """Tear down a per-user agent. Missing agents are not an error."""
+    """Tear down a per-user agent. Missing agents are not an error.
+
+    Tries the modern ``bootout`` first, then falls back to the legacy
+    ``unload -w`` form. We accept either success because users on
+    older macOS won't have ``bootout``. A failure from *both* is
+    surfaced so callers don't silently leave a registered agent
+    behind after the plist file is removed.
+    """
     uid = os.getuid()
-    _run(["launchctl", "bootout", f"gui/{uid}", str(plist)])
-    _run(["launchctl", "unload", "-w", str(plist)])
-    return True, ""
+    rc_b, out_b = _run(["launchctl", "bootout", f"gui/{uid}", str(plist)])
+    if rc_b == 0:
+        return True, ""
+    rc_u, out_u = _run(["launchctl", "unload", "-w", str(plist)])
+    if rc_u == 0:
+        return True, ""
+    # macOS reports "Could not find specified service" when the agent
+    # is already absent — treat that as success so uninstall stays
+    # idempotent.
+    combined = (out_b + out_u).lower()
+    for phrase in (
+        "could not find",
+        "no such file",
+        "service is not loaded",
+    ):
+        if phrase in combined:
+            return True, ""
+    return False, f"bootout: {out_b.strip()}; unload: {out_u.strip()}"
 
 
 # --- Public API ----------------------------------------------------------

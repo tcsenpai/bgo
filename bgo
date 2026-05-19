@@ -1804,9 +1804,14 @@ def cmd_tray(args):
         )
         if not ok:
             return 1
-        # Re-exec self with the same args so the freshly-installed
-        # deps are picked up by a clean interpreter.
-        os.execvp(sys.argv[0], sys.argv)
+        # Re-exec via the installed entrypoint so the freshly-injected
+        # deps are picked up by a clean interpreter. We prefer
+        # shutil.which("bgo") over sys.argv[0] because argv[0] may be
+        # the bare script path ("./bgo") or "python", neither of which
+        # have the new pystray on their import path after a uv/pipx
+        # injection completed.
+        bgo_bin = shutil.which("bgo") or sys.argv[0]
+        os.execvp(bgo_bin, [bgo_bin, "tray"])
         return 0  # unreachable
 
     return _tray.run(poll_seconds=getattr(args, "poll", None))

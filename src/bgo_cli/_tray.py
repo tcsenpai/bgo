@@ -166,22 +166,29 @@ def run_bgo(*args: str) -> int:
 
 
 def _open_logs(name: str) -> None:
-    """Open the proc's stdout log in ``$EDITOR`` or the OS default."""
+    """Open the proc's stdout log in ``$EDITOR`` or the OS default.
+
+    Failures are reported to stderr so the user has *some* signal when
+    both the editor and the OS default opener fail (e.g. headless
+    server with no xdg-open). They do not propagate — the tray loop
+    must stay alive.
+    """
     log = BGO_DIR / "logs" / f"{name}.out.log"
     if not log.exists():
+        sys.stderr.write(f"bgo tray: no log file for {name}\n")
         return
     editor = os.environ.get("EDITOR")
     if editor:
         try:
             subprocess.Popen([editor, str(log)])
             return
-        except OSError:
-            pass
+        except OSError as exc:
+            sys.stderr.write(f"bgo tray: $EDITOR ({editor}) failed: {exc}\n")
     opener = "open" if sys.platform == "darwin" else "xdg-open"
     try:
         subprocess.Popen([opener, str(log)])
-    except OSError:
-        pass
+    except OSError as exc:
+        sys.stderr.write(f"bgo tray: {opener} failed: {exc}\n")
 
 
 def _poll_interval() -> int:
@@ -225,10 +232,18 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs pystray
     quit_flag = {"stop": False}
 
     def make_proc_submenu(snap: ProcSnapshot) -> Menu:
+        # ``bgo start <name>`` without a command argument is rejected
+        # by the core CLI (start requires REMAINDER). For a known
+        # registered proc the correct re-spawn is ``bgo restart``,
+        # which preserves the stored command. We surface "Restart"
+        # for online procs and "Start" (which shells out to restart
+        # under the hood) for stopped ones — both routes hit the
+        # same code path, but the labels match user expectations.
+        is_running = snap.status == "running" and not snap.errored
+        primary_label = "Restart" if is_running else "Start"
         return Menu(
-            Item("Start",   lambda _icon, _it, n=snap.name: run_bgo("start", n)),
-            Item("Stop",    lambda _icon, _it, n=snap.name: run_bgo("stop", n)),
-            Item("Restart", lambda _icon, _it, n=snap.name: run_bgo("restart", n)),
+            Item(primary_label, lambda _icon, _it, n=snap.name: run_bgo("restart", n)),
+            Item("Stop",        lambda _icon, _it, n=snap.name: run_bgo("stop", n)),
             Menu.SEPARATOR,
             Item("Open logs", lambda _icon, _it, n=snap.name: _open_logs(n)),
         )
