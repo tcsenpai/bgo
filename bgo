@@ -90,8 +90,18 @@ from bgo_cli._watcher import (  # noqa: E402
 # --- Commands ---
 
 
-def cmd_start(args):
-    """Start a process in the background."""
+def cmd_start(args: argparse.Namespace) -> int:
+    """Start a process in the background.
+
+    Reads the command from ``args.cmd`` (REMAINDER form) or
+    ``args.command`` (programmatic call). Refuses to overwrite a
+    proc that's already running under the same name. Writes the
+    initial state, spawns the watcher if requested, prints a brief
+    confirmation line plus log-path hint.
+
+    :returns: 0 on success, 1 on any failure (no command supplied,
+              duplicate name, FileNotFoundError, etc).
+    """
     init_dirs()
 
     name = args.name
@@ -209,8 +219,17 @@ def cmd_start(args):
     return 0
 
 
-def cmd_stop(args):
-    """Stop a running process."""
+def cmd_stop(args: argparse.Namespace) -> int:
+    """Stop a running process.
+
+    Marks the state as stopped BEFORE issuing the kill so a watching
+    sidecar sees the flag and exits without trying to restart. Kills
+    the watcher first, then the target, escalating to SIGKILL on
+    timeout unless ``--force`` was passed (which goes straight to it).
+
+    :returns: 0 if the process is stopped (or was already), 1 on
+              kill failure.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -252,8 +271,16 @@ def cmd_stop(args):
     return 0
 
 
-def cmd_restart(args):
-    """Restart a process. Clears errored state and re-spawns watcher if enabled."""
+def cmd_restart(args: argparse.Namespace) -> int:
+    """Restart a process; clears errored state and re-spawns the watcher.
+
+    Restart counters are preserved by default so chronic crashers stay
+    visible across manual restarts. Pass ``--reset-counters`` to wipe
+    the count to zero explicitly. The watcher (if any) is killed
+    before the target so it doesn't observe the death and race us.
+
+    :returns: ``cmd_start``'s return code (0 on success, 1 otherwise).
+    """
     name = args.name
     info = load_proc(name)
 
@@ -293,8 +320,17 @@ def cmd_restart(args):
     return cmd_start(restart_args)
 
 
-def cmd_watch(args):
-    """Attach a watcher to an existing process (or replace its config)."""
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Attach a watcher to an existing running process.
+
+    If ``--reset`` is set OR the proc has no prior watch block, a
+    fresh default config is built from overrides. Otherwise the
+    prior config is carried forward with overrides merged in,
+    errored fields cleared, and ``enabled=True`` re-asserted.
+
+    :returns: 0 on success, 1 if the proc is unknown / not running
+              / the watcher failed to spawn.
+    """
     name = args.name
     info = load_proc(name)
     if not info:
@@ -348,8 +384,11 @@ def cmd_watch(args):
     return 0
 
 
-def cmd_unwatch(args):
-    """Detach watcher from a process (keeps the process running)."""
+def cmd_unwatch(args: argparse.Namespace) -> int:
+    """Detach the watcher from a process. The target keeps running.
+
+    :returns: 0 always (no-op when nothing is being watched).
+    """
     name = args.name
     info = load_proc(name)
     if not info:
@@ -379,8 +418,8 @@ def _watch_cell(info: dict, level: str | None = None) -> str:
     return color("green", f"{g['watching']} {w.get('restarts', 0)}")
 
 
-def _clear_screen():
-    """ANSI clear-screen + home cursor. TTY safe."""
+def _clear_screen() -> None:
+    """Clear the terminal and home the cursor. TTY-only; no-op otherwise."""
     if sys.stdout.isatty():
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
@@ -439,8 +478,15 @@ def _pad(text: str, width: int, align: str = "left") -> str:
     return text + " " * pad
 
 
-def _print_status_table(rows: list[dict], level: str | None = None):
-    """Render the status table for a snapshot."""
+def _print_status_table(rows: list[dict], level: str | None = None) -> None:
+    """Render the status table for a snapshot at the given rendering level.
+
+    Columns: NAME / STATUS / PID / CPU / MEM / UPTIME / WATCH /
+    COMMAND. The COMMAND column flexes to fill the terminal width;
+    the rest have fixed widths sized to fit their longest expected
+    value. Fancy mode draws Unicode box-drawing borders around the
+    table; normal mode prints ASCII rules instead.
+    """
     if not rows:
         return
     level = level or _detect_table_level()
@@ -548,8 +594,19 @@ def _level_from_args(args) -> str | None:
     return None
 
 
-def cmd_status(args):
-    """Show status of all processes."""
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show status of all processes (or detail for one).
+
+    Modes (mutually exclusive, evaluated in order):
+
+    1. ``--json``        — emit JSON for ``args.name`` or all procs.
+    2. ``-w`` / ``--watch`` — full-screen auto-refresh until Ctrl-C.
+    3. ``args.name`` set  — detailed single-proc view.
+    4. default           — one-shot table for every registered proc.
+
+    :returns: 0 on success, 1 if ``--json`` was requested for a
+              specific name that doesn't exist.
+    """
     # JSON output mode bypasses everything else
     if getattr(args, "json", False):
         procs = load_all_procs()
@@ -610,8 +667,13 @@ def cmd_status(args):
     return 0
 
 
-def _print_proc_detail(info: dict):
-    """Print detailed info for a single process."""
+def _print_proc_detail(info: dict) -> None:
+    """Print the detail card for a single process state ``info`` dict.
+
+    Lists status / PID / command / cwd / start time / live CPU+MEM
+    (when running) / log sizes / watch config + restart counters /
+    errored reason + last stderr tail (when errored).
+    """
     pid = info["pid"]
     running = is_running(pid)
     status_str = color("green", "online") if running else color("red", "stopped")
@@ -686,8 +748,17 @@ def _human_size(n: int) -> str:
     return f"{n:.1f}TB"
 
 
-def cmd_logs(args):
-    """Show logs for a process."""
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Show logs for a process.
+
+    Stream selection: ``--watcher`` -> watcher event log;
+    ``--stderr`` -> stderr; ``--stdout`` (or default) -> stdout.
+    With ``--follow`` / ``-f``, exec ``tail -f`` for live streaming;
+    otherwise tail the last ``-n`` lines (default 50) and exit.
+
+    :returns: 0 on success, 1 if the proc is unknown or the log
+              file disappeared between stat and open.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -778,16 +849,16 @@ def cmd_logs(args):
     return 0
 
 
-def cmd_logs_follow(args):
-    """Follow logs for a process (shorthand for logs -f)."""
+def cmd_logs_follow(args: argparse.Namespace) -> int:
+    """Follow logs for a process. Shorthand for ``bgo logs <name> -f``."""
     args.follow = True
     if not hasattr(args, "lines") or args.lines is None:
         args.lines = 10
     return cmd_logs(args)
 
 
-def cmd_clean(args):
-    """Remove stopped processes from state."""
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Drop every stopped proc from state (keeps log files in place)."""
     procs = load_all_procs()
     cleaned = []
 
@@ -807,8 +878,16 @@ def cmd_clean(args):
     return 0
 
 
-def cmd_resurrect(args):
-    """Restart all processes that were running before shutdown/reboot."""
+def cmd_resurrect(args: argparse.Namespace) -> int:
+    """Restart every proc whose last recorded status was ``running``.
+
+    Used by the systemd / launchd autostart entry to bring back
+    managed procs after a reboot or session login. Procs that the
+    user manually stopped (status=stopped) are left alone.
+
+    :returns: 0 if all candidates restarted (or none existed), 1 if
+              any failed to start.
+    """
     procs = load_all_procs()
 
     if not procs:
@@ -953,7 +1032,7 @@ def _restart_one(name: str, info: dict) -> int:
     return cmd_start(restart_args)
 
 
-def cmd_restart_stopped(args):
+def cmd_restart_stopped(args: argparse.Namespace) -> int:
     """Restart procs that are not currently running.
 
     Includes both explicitly stopped procs AND procs whose state says
@@ -1028,7 +1107,7 @@ def cmd_restart_stopped(args):
     return 0
 
 
-def cmd_restart_last(args):
+def cmd_restart_last(args: argparse.Namespace) -> int:
     """Restart processes ordered by most-recent-first.
 
     With --all: restart every not-running proc in most-recent order.
@@ -1092,8 +1171,14 @@ def cmd_restart_last(args):
     return 0
 
 
-def cmd_delete(args):
-    """Delete a process from state (stop if running first)."""
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Delete a process from state (stop it first if running).
+
+    Drops log files too unless ``--keep-logs`` is passed. Asks for
+    confirmation when stopping a running proc, unless ``-y``.
+
+    :returns: 0 on success, 1 if the proc is unknown.
+    """
     name = args.name
     info = load_proc(name)
 
@@ -1121,7 +1206,7 @@ def cmd_delete(args):
 # --- Optional feature handlers ---
 
 
-def cmd_autostart(args):
+def cmd_autostart(args: argparse.Namespace) -> int:
     """Install / uninstall / inspect login autostart for ``bgo resurrect``.
 
     Subcommands (``args.action``):
@@ -1181,7 +1266,7 @@ def cmd_autostart(args):
     return 1
 
 
-def cmd_tray(args):
+def cmd_tray(args: argparse.Namespace) -> int:
     """Launch the system-tray icon (optional extra ``bgo-cli[tray]``).
 
     If PySide6 is not importable, delegates to
@@ -1218,7 +1303,8 @@ def cmd_tray(args):
 # --- CLI ---
 
 
-def main():
+def main() -> int:
+    """Entry point. Returns the process exit code for ``sys.exit``."""
     init_dirs()
 
     # Hidden subcommand for internal watcher loop
