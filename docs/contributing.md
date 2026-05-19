@@ -51,9 +51,9 @@ No required linter is wired into CI yet. The newer modules
 new code at that bar.
 
 The remaining cmd_* handlers in the root `bgo` script were typed in
-the [fu #5 sweep](#) — every `cmd_*` signature is
-`(args: argparse.Namespace) -> int` with docstrings describing
-inputs / behavior / exit codes.
+the [#5 sweep](https://github.com/tcsenpai/bgo/issues/5) — every
+`cmd_*` signature is `(args: argparse.Namespace) -> int` with
+docstrings describing inputs / behavior / exit codes.
 
 ## Project structure
 

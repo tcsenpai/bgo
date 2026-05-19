@@ -83,9 +83,12 @@ def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
         return result_map
     # ps -p accepts comma-separated pids on both Linux and macOS.
     pid_arg = ",".join(str(p) for p in pids)
+    # POSIX-portable header suppression: setting each column's header
+    # to an empty string (via "key=") tells ps to emit no header line.
+    # macOS/BSD ps does not support GNU's --no-headers long option.
     try:
         result = subprocess.run(
-            ["ps", "-p", pid_arg, "-o", "pid,%cpu,%mem,etime", "--no-headers"],
+            ["ps", "-p", pid_arg, "-o", "pid=,%cpu=,%mem=,etime="],
             capture_output=True,
             text=True,
             timeout=4,

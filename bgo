@@ -1229,14 +1229,23 @@ def cmd_autostart(args: argparse.Namespace) -> int:
 
     if action == "status":
         s = _autostart.status()
+        tray_only = getattr(args, "tray", False)
         if getattr(args, "json", False):
-            print(json.dumps(s, indent=2))
+            if tray_only:
+                print(json.dumps({
+                    "backend": s.get("backend"),
+                    "tray": s.get("tray"),
+                    "tray_path": s.get("tray_path"),
+                }, indent=2))
+            else:
+                print(json.dumps(s, indent=2))
             return 0
         if s["backend"] is None:
             print(f"{color('yellow', '⚠')}  autostart not supported on this platform")
             return 1
         print(f"backend:   {s['backend']}")
-        for key in ("resurrect", "tray"):
+        keys = ("tray",) if tray_only else ("resurrect", "tray")
+        for key in keys:
             mark = color("green", "✓") if s[key] else color("gray", "·")
             path = s.get(f"{key}_path") or "(not installed)"
             print(f"{mark} {key:<10} {path}")
@@ -1292,9 +1301,10 @@ def cmd_tray(args: argparse.Namespace) -> int:
         # shutil.which("bgo") over sys.argv[0] because argv[0] may be
         # the bare script path ("./bgo") or "python", neither of which
         # have the new PySide6 on their import path after a uv/pipx
-        # injection completed.
+        # injection completed. Pass the original argv[1:] through so
+        # flags like --poll survive the re-exec.
         bgo_bin = shutil.which("bgo") or sys.argv[0]
-        os.execvp(bgo_bin, [bgo_bin, "tray"])
+        os.execvp(bgo_bin, [bgo_bin, *sys.argv[1:]])
         return 0  # unreachable
 
     return _tray.run(poll_seconds=getattr(args, "poll", None))
@@ -1620,6 +1630,10 @@ Watch mode (auto-restart on crash):
             help="Target the tray autostart entry instead of resurrect",
         )
     sp_status = autostart_sub.add_parser("status", help="Show install state")
+    sp_status.add_argument(
+        "--tray", action="store_true",
+        help="Show status for the tray entry only (default: both)",
+    )
     sp_status.add_argument(
         "--json", action="store_true", help="Machine-readable output",
     )

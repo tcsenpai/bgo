@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -59,28 +60,43 @@ def watcher_log(name: str, msg: str) -> None:
 
 
 def load_proc(name: str) -> dict | None:
-    """Return parsed state for ``name``, or ``None`` if missing/corrupt."""
+    """Return parsed state for ``name``, or ``None`` if missing/corrupt.
+
+    Non-object JSON (lists, strings, numbers) is treated as corrupt
+    because the rest of the codebase assumes a mapping (``.get(...)``).
+    """
     pf = proc_file(name)
     if not pf.exists():
         return None
     try:
-        return json.loads(pf.read_text())
+        data = json.loads(pf.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def save_proc(name: str, info: dict) -> None:
     """Atomically write ``info`` as ``name``'s state file.
 
-    Uses a tmp file plus ``os.replace`` so concurrent writers (CLI +
-    watcher) cannot land a torn JSON. ``os.replace`` is atomic on
-    POSIX when src and dst share a filesystem, which is true here
-    (both under ``~/.bgo/procs/``).
+    Uses a unique tmp file in the same directory plus ``os.replace``
+    so concurrent writers (CLI + watcher) cannot stomp on each other's
+    in-flight tmp file. ``os.replace`` is atomic on POSIX when src and
+    dst share a filesystem, which is true here (both under
+    ``~/.bgo/procs/``).
     """
     pf = proc_file(name)
-    tmp = pf.with_suffix(pf.suffix + ".tmp")
-    tmp.write_text(json.dumps(info, indent=2))
-    os.replace(tmp, pf)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{pf.stem}.", suffix=".tmp", dir=str(pf.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, pf)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def delete_proc(name: str, keep_logs: bool = False) -> None:
@@ -99,9 +115,11 @@ def load_all_procs() -> dict[str, dict]:
     for pf in sorted(PROCS_DIR.glob("*.json")):
         try:
             info = json.loads(pf.read_text())
-            procs[info.get("name", pf.stem)] = info
         except (json.JSONDecodeError, OSError):
             continue
+        if not isinstance(info, dict):
+            continue
+        procs[info.get("name", pf.stem)] = info
     return procs
 
 

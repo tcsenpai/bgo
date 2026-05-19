@@ -107,10 +107,10 @@ def _installer_available(installer: InstallerKind) -> bool:
 
 
 def ensure_installed(auto: bool = False) -> bool:
-    """Make sure ``pystray`` + ``PIL`` are importable. Install if not.
+    """Make sure ``PySide6`` is importable. Install if not.
 
     :param auto: Skip the y/N prompt and run the install command.
-    :returns:    ``True`` once both deps import cleanly. ``False`` if
+    :returns:    ``True`` once PySide6 imports cleanly. ``False`` if
                  the user declined or the install command failed.
 
     .. important::

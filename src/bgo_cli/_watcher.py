@@ -135,6 +135,7 @@ def _bgo_entrypoint() -> str:
 
 def _spawn_watcher(name: str) -> tuple[int | None, int | None]:
     """Detach a watcher subprocess for ``name``. Returns ``(pid, pgid)``."""
+    wlog = None
     try:
         wlog = open(watcher_log_path(name), "a")
         bgo_bin = _bgo_entrypoint()
@@ -145,10 +146,12 @@ def _spawn_watcher(name: str) -> tuple[int | None, int | None]:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-        wlog.close()
     except Exception as e:
         watcher_log(name, f"failed to spawn watcher: {e}")
         return None, None
+    finally:
+        if wlog is not None:
+            wlog.close()
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
@@ -198,6 +201,8 @@ def _restart_proc_inplace(info: dict) -> tuple[int | None, int | None, str | Non
     cwd = info.get("cwd") or os.getcwd()
     stdout_log = log_path(name, "out")
     stderr_log = log_path(name, "err")
+    out_f = None
+    err_f = None
     try:
         out_f = open(stdout_log, "a")
         err_f = open(stderr_log, "a")
@@ -215,14 +220,17 @@ def _restart_proc_inplace(info: dict) -> tuple[int | None, int | None, str | Non
             start_new_session=True,
             cwd=cwd,
         )
-        out_f.close()
-        err_f.close()
     except FileNotFoundError:
         return None, None, f"command not found: {command[0]}"
     except PermissionError:
         return None, None, f"permission denied: {command[0]}"
     except Exception as e:
         return None, None, f"failed to start: {e}"
+    finally:
+        if out_f is not None:
+            out_f.close()
+        if err_f is not None:
+            err_f.close()
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:

@@ -121,7 +121,8 @@ uv run pytest tests/test_notify.py -v   # one module
 ## Future work
 
 - Extract `cmd_*` handlers from the root script into
-  `bgo_cli._commands` (tracked in [fu #6 partial
-  completion](#)). Status rendering, the interactive multiselect,
-  and the argparse front-end can follow.
+  `bgo_cli._commands` (tracked in
+  [#6 (partial)](https://github.com/tcsenpai/bgo/issues/6)).
+  Status rendering, the interactive multiselect, and the argparse
+  front-end can follow.
 - mypy/pyright strict pass over the script (modules already type-clean).

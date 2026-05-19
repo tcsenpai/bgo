@@ -320,9 +320,13 @@ def uninstall(target: Target) -> tuple[bool, str]:
         path.unlink(missing_ok=True)
         return True, ""
 
-    # launchd
+    # launchd. If unload fails for a reason other than "already absent",
+    # leave the plist in place so the user can retry — deleting it would
+    # orphan a still-loaded agent that's hard to manage afterwards.
     if path.exists():
-        _launchctl_unload(path)
+        ok, err = _launchctl_unload(path)
+        if not ok:
+            return False, err
         path.unlink(missing_ok=True)
     return True, ""
 

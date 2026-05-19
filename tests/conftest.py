@@ -16,6 +16,14 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 BGO_PATH = ROOT / "bgo"
+SRC_PATH = ROOT / "src"
+
+# Make `from bgo_cli import ...` resolvable during pytest collection,
+# before any test module is imported. CI runs `python -m pytest` from
+# the repo root without installing the package, so without this the
+# test_*.py modules that import bgo_cli fail at collection time.
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
 
 
 def _load_bgo():

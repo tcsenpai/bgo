@@ -39,10 +39,17 @@ ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 def color(name: str, text: str) -> str:
-    """Wrap text in color codes, only if stdout is a TTY."""
+    """Wrap text in color codes, only if stdout is a TTY.
+
+    Unknown color names return the text unchanged (no reset code
+    appended), preserving the documented "no wrapping" contract.
+    """
     if not sys.stdout.isatty():
         return str(text)
-    return f"{COLORS.get(name, '')}{text}{COLORS['reset']}"
+    code = COLORS.get(name)
+    if not code:
+        return str(text)
+    return f"{code}{text}{COLORS['reset']}"
 
 
 def strip_ansi(s: str) -> str:
@@ -51,7 +58,17 @@ def strip_ansi(s: str) -> str:
 
 
 def truncate(s: str, width: int) -> str:
-    """Truncate string to fit in width, accounting for ANSI codes."""
+    """Truncate string to fit in width, accounting for ANSI codes.
+
+    Edge cases for narrow columns:
+      * ``width <= 0``  -> empty string
+      * ``width <= 3``  -> ``"..."[:width]`` so output never exceeds
+        ``width`` (the 3-char ellipsis would otherwise overflow).
+    """
+    if width <= 0:
+        return ""
+    if width <= 3:
+        return "..."[:width]
     plain = strip_ansi(s)
     if len(plain) > width:
         return s[: width - 3] + "..."
