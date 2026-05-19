@@ -176,9 +176,9 @@ fi
 if [[ "$NEW_VERSION" != "$CURRENT_VERSION" ]]; then
     say "updating version files"
     # pyproject.toml: version = "..."
-    sed -i.bak -E "s/^version\s*=\s*\"[^\"]+\"/version = \"${NEW_VERSION}\"/" pyproject.toml
+    sed -i.bak -E "s/^version[[:space:]]*=[[:space:]]*\"[^\"]+\"/version = \"${NEW_VERSION}\"/" pyproject.toml
     # __init__.py: __version__ = "..."
-    sed -i.bak -E "s/^__version__\s*=\s*\"[^\"]+\"/__version__ = \"${NEW_VERSION}\"/" src/bgo_cli/__init__.py
+    sed -i.bak -E "s/^__version__[[:space:]]*=[[:space:]]*\"[^\"]+\"/__version__ = \"${NEW_VERSION}\"/" src/bgo_cli/__init__.py
     rm -f pyproject.toml.bak src/bgo_cli/__init__.py.bak
 
     # Verify the edits actually took
