@@ -530,7 +530,7 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
             if cmd == "__quit__":
                 act.triggered.connect(app.quit)
             elif cmd == "__refresh__":
-                act.triggered.connect(lambda *_: rebuild())
+                act.triggered.connect(lambda *_: rebuild(force=True))
             else:
                 act.triggered.connect(lambda *_, c=cmd: run_bgo(c))
             menu.addAction(act)
@@ -538,12 +538,27 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
 
         return menu
 
-    def rebuild() -> None:
+    # Last snapshot list that produced the current menu. Rebuilding a
+    # QMenu allocates dozens of QObjects (plus native NSMenu bridges on
+    # macOS) that Qt never fully reclaims, so unconditional rebuilds on
+    # every poll tick leak — ~40 KB every 3 s adds up to gigabytes over
+    # days. Skipping no-op rebuilds keeps the steady state allocation-free.
+    last_snapshots: dict[str, list[ProcSnapshot] | None] = {"value": None}
+
+    def rebuild(force: bool = False) -> None:
         """Replace the tray's menu and icon from the latest snapshot."""
+        old_menu = tray.contextMenu()
+        # Never swap the menu while the user has it open: the deferred
+        # delete below would tear it down mid-interaction.
+        if old_menu is not None and old_menu.isVisible():
+            return
+        snapshots = load_snapshots()
+        if not force and snapshots == last_snapshots["value"]:
+            return
+        last_snapshots["value"] = snapshots
         # Drop old refs so they can be reclaimed. Qt will free them
         # once the previous menu's slots stop firing.
         held.clear()
-        snapshots = load_snapshots()
         status_key = _aggregate_status(snapshots)
         if status_key != current_status["key"]:
             tray.setIcon(make_icon(_DOT_COLORS[status_key]))
@@ -554,6 +569,11 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         new_menu = build_menu_from(snapshots)
         held.append(new_menu)
         tray.setContextMenu(new_menu)
+        if old_menu is not None:
+            # setContextMenu does not take ownership of (or free) the
+            # previous menu; without an explicit deleteLater the C++
+            # object and its native counterparts outlive the wrapper.
+            old_menu.deleteLater()
 
     def on_activated(reason: "QSystemTrayIcon.ActivationReason") -> None:
         """Show the context menu on left-click and middle-click.
