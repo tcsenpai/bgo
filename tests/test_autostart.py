@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from bgo_cli import _autostart
+from bgo_cli import _autostart, _proc
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def linux_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(_autostart.sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr(_autostart.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(_autostart.shutil, "which", lambda _name: "/usr/local/bin/bgo")
+    monkeypatch.setattr(_proc.shutil, "which", lambda _name: "/usr/local/bin/bgo")
     return tmp_path
 
 
@@ -31,7 +31,7 @@ def darwin_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(_autostart.sys, "platform", "darwin")
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(_autostart.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(_autostart.shutil, "which", lambda _name: "/opt/bin/bgo")
+    monkeypatch.setattr(_proc.shutil, "which", lambda _name: "/opt/bin/bgo")
     return tmp_path
 
 
@@ -310,7 +310,7 @@ def test_status_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_resolve_bgo_binary_prefers_which(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_autostart.shutil, "which", lambda _: "/found/bgo")
+    monkeypatch.setattr(_proc.shutil, "which", lambda _: "/found/bgo")
     assert _autostart._resolve_bgo_binary() == "/found/bgo"
 
 
@@ -319,6 +319,6 @@ def test_resolve_bgo_binary_falls_back_to_argv0(
 ) -> None:
     fake = tmp_path / "bgo"
     fake.touch()
-    monkeypatch.setattr(_autostart.shutil, "which", lambda _: None)
-    monkeypatch.setattr(_autostart.sys, "argv", [str(fake)])
+    monkeypatch.setattr(_proc.shutil, "which", lambda _: None)
+    monkeypatch.setattr(_proc.sys, "argv", [str(fake)])
     assert _autostart._resolve_bgo_binary() == str(fake.resolve())

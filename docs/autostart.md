@@ -1,8 +1,8 @@
 # Login autostart
 
 `bgo autostart` installs a per-user service that runs `bgo resurrect`
-on session start, restoring every process that was registered as
-`running` at shutdown. Backends are auto-detected:
+on session start, restoring managed processes according to their
+per-proc autostart policy. Backends are auto-detected:
 
 | Platform | Backend | Path |
 |---|---|---|
@@ -18,6 +18,8 @@ bgo autostart status             # show what's installed
 bgo autostart status --json      # machine-readable
 bgo autostart uninstall          # remove resurrect
 bgo autostart uninstall --tray   # remove tray entry only
+bgo autostart set <name> always  # set per-proc policy
+bgo autostart show <name>        # show per-proc policy
 ```
 
 `install` is idempotent — re-running overwrites the unit content but
@@ -69,9 +71,15 @@ install, GNOME extension, etc).
 
 ## How `resurrect` decides what to restart
 
-A proc is restarted iff:
+Each proc has an `autostart` policy stored in its state file:
 
-1. Its state file says `status: running`.
-2. Its PID is not currently alive (i.e. it died with the session).
+| Policy | Behavior |
+|---|---|
+| `always` | Restart on login unless already running. |
+| `unless-stopped` (default) | Restart on login unless the user manually stopped it (`status: stopped`). |
+| `never` | Never restart on login. |
 
-Procs the user manually stopped (`status: stopped`) are left alone.
+A proc is only resurrected when its recorded PID is not currently alive
+(i.e. it died with the session). New procs default to
+`unless-stopped`; use `--autostart` at start time or `bgo autostart set`
+to change it later.

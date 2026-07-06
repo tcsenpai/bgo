@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from bgo_cli._term import color
 
@@ -114,15 +115,17 @@ def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
 def _looks_like_command(arg: str) -> bool:
     """Return True if ``arg`` looks like an executable, not a plain name.
 
-    A path separator, a dot (extension), or a hit on ``shutil.which``
-    each qualify. Used by direct-mode parsing to decide whether the
-    first positional is a name or the start of the command.
+    A path separator, a known script/binary extension, or a hit on
+    ``shutil.which`` each qualify. Bare dots (e.g. ``my.app``) are no
+    longer treated as commands so dotted process names parse correctly
+    in direct mode.
     """
     if os.sep in arg or arg.startswith("./"):
         return True
-    if "." in arg:
-        return True
     if shutil.which(arg):
+        return True
+    known_exts = (".py", ".sh", ".js", ".ts", ".rb", ".pl", ".exe", ".bin")
+    if any(arg.lower().endswith(ext) for ext in known_exts):
         return True
     return False
 
@@ -143,6 +146,20 @@ def resolve_command(cmd: list[str]) -> list[str]:
         cmd = cmd[:]
         cmd[0] = binary
     return cmd
+
+
+def resolve_bgo_binary() -> str:
+    """Locate the ``bgo`` executable for re-invoking ourselves.
+
+    Prefer ``shutil.which('bgo')`` so installed entrypoints (uv tool,
+    pipx, pip user site) win over the raw script path. Fall back to
+    ``sys.argv[0]`` resolved to an absolute path, which is correct when
+    running ``./bgo`` from a source checkout.
+    """
+    found = shutil.which("bgo")
+    if found:
+        return str(Path(found).resolve())
+    return str(Path(sys.argv[0]).resolve())
 
 
 def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
@@ -190,5 +207,5 @@ __all__ = [
     "_is_zombie", "is_running",
     "get_process_info", "get_process_info_batch",
     "_looks_like_command", "derive_name", "resolve_command",
-    "kill_process",
+    "resolve_bgo_binary", "kill_process",
 ]

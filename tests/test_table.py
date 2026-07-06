@@ -1,5 +1,6 @@
 """Terminal-capability detection + table rendering smoke tests."""
 
+import argparse
 import os
 import sys
 
@@ -134,3 +135,12 @@ def test_print_status_table_fancy_smoke(bgo, capsys):
     assert "┓" in out
     assert "┗" in out
     assert "┛" in out
+
+
+def test_status_json_does_not_mutate_state(bgo, monkeypatch, capsys):
+    """``bgo status --json`` must be read-only for dead procs."""
+    bgo.save_proc("dead", {"name": "dead", "pid": 999999, "status": "running", "command": ["true"]})
+    monkeypatch.setenv("BGO_TABLE", "plain")
+    bgo.cmd_status(argparse.Namespace(json=True, name=None, watch=False, interval=None, plain=True, fancy=False))
+    info = bgo.load_proc("dead")
+    assert info["status"] == "running"

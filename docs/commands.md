@@ -54,6 +54,16 @@ in-shell summary.
 
 Full details: [Watch mode](watch-mode.md).
 
+## Autostart policy
+
+| Command | Description |
+|---|---|
+| `bgo start --autostart unless-stopped <name> -- <cmd>` | Start with policy |
+| `bgo autostart set <name> {always,unless-stopped,never}` | Change policy |
+| `bgo autostart show <name>` | Show current policy |
+
+Default is `unless-stopped`. See [Login autostart](autostart.md) for details.
+
 ## Autostart
 
 | Command | Description |

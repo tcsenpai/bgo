@@ -163,13 +163,12 @@ def build_menu_spec(snapshots: Iterable[ProcSnapshot]) -> MenuSpec:
 def _bgo_binary() -> str:
     """Resolve the ``bgo`` binary to shell out to.
 
-    Mirrors ``_autostart._resolve_bgo_binary`` but kept local to avoid
-    importing autostart just for one helper.
+    Delegates to :func:`bgo_cli._proc.resolve_bgo_binary` so the tray,
+    autostart, and watcher all agree on the binary to use.
     """
-    found = shutil.which("bgo")
-    if found:
-        return found
-    return str(Path(sys.argv[0]).resolve())
+    from bgo_cli._proc import resolve_bgo_binary
+
+    return resolve_bgo_binary()
 
 
 def run_bgo(*args: str) -> int:
@@ -247,8 +246,9 @@ def _open_logs(name: str) -> None:
         sys.stderr.write(f"bgo tray: no log file for {name}\n")
         return
 
-    bgo_bin = shutil.which("bgo") or str(Path(sys.argv[0]).resolve())
-    follow_cmd = [bgo_bin, "logs", name, "-f"]
+    from bgo_cli._proc import resolve_bgo_binary
+
+    follow_cmd = [resolve_bgo_binary(), "logs", name, "-f"]
 
     if sys.platform == "darwin":
         _open_logs_darwin(follow_cmd)

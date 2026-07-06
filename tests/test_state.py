@@ -71,3 +71,12 @@ def test_delete_proc_keep_logs(bgo):
     assert bgo.log_path("demo", "out").exists()
     assert bgo.log_path("demo", "err").exists()
     assert bgo.watcher_log_path("demo").exists()
+
+
+def test_watcher_log_uses_utc_iso(bgo):
+    """Watcher log timestamps must carry a UTC offset for consistency."""
+    bgo.watcher_log("demo", "hello")
+    text = bgo.watcher_log_path("demo").read_text()
+    assert text.startswith("[")
+    assert "+00:00" in text or "Z" in text
+    assert "hello" in text

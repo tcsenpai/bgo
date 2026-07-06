@@ -29,7 +29,6 @@ safe to call when nothing is installed.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -124,20 +123,13 @@ def _launchd_dir() -> Path:
 def _resolve_bgo_binary() -> str:
     """Locate the ``bgo`` executable to embed in the unit file.
 
-    Falls back to ``sys.argv[0]`` only if ``shutil.which`` cannot find
-    the command on PATH — this happens when bgo is installed in a
-    sandboxed venv (e.g. ``uv tool``) whose bin dir is on the user's
-    PATH but not the test runner's PATH.
+    Delegates to :func:`bgo_cli._proc.resolve_bgo_binary` so the
+    autostart unit, the watcher, and the tray all use the same
+    resolution logic.
     """
-    found = shutil.which("bgo")
-    if found:
-        # ``which`` already returns absolute paths on all supported
-        # platforms, but harden against PATH entries that contain
-        # ``..`` or are themselves relative (rare but legal).
-        return str(Path(found).resolve())
-    # Fall back to the script that invoked us. resolve() collapses
-    # symlinks; we want the absolute, canonical path.
-    return str(Path(sys.argv[0]).resolve())
+    from bgo_cli._proc import resolve_bgo_binary
+
+    return resolve_bgo_binary()
 
 
 def _path_for(backend: Backend, target: Target) -> Path:

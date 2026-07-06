@@ -22,7 +22,6 @@ watcher runs detached with no TTY.
 from __future__ import annotations
 
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -36,6 +35,7 @@ from bgo_cli._state import (
     save_proc,
     watcher_log,
     watcher_log_path,
+    write_start_markers,
 )
 
 # Defaults for a fresh watch block. ``WATCH_DEFAULTS`` is consulted at
@@ -122,15 +122,12 @@ def _default_watch_config(overrides: dict | None = None) -> dict:
 def _bgo_entrypoint() -> str:
     """Resolve the ``bgo`` binary path for re-invoking the watcher loop.
 
-    Prefer ``shutil.which("bgo")`` so we hit the installed entrypoint
-    (uv tool / pipx / pip's user site). Fall back to the script path
-    via ``sys.argv[0]`` resolved through :func:`os.path.realpath`,
-    which is correct when running ``./bgo`` from the repo.
+    Delegates to :func:`bgo_cli._proc.resolve_bgo_binary` so all
+    re-invocation paths agree on the binary to use.
     """
-    found = shutil.which("bgo")
-    if found:
-        return found
-    return os.path.realpath(sys.argv[0]) if sys.argv else ""
+    from bgo_cli._proc import resolve_bgo_binary
+
+    return resolve_bgo_binary()
 
 
 def _spawn_watcher(name: str) -> tuple[int | None, int | None]:
@@ -199,19 +196,14 @@ def _restart_proc_inplace(info: dict) -> tuple[int | None, int | None, str | Non
     name = info["name"]
     command = info["command"]
     cwd = info.get("cwd") or os.getcwd()
-    stdout_log = log_path(name, "out")
-    stderr_log = log_path(name, "err")
+    stdout_log, stderr_log = write_start_markers(
+        name, command, tag="watch restart"
+    )
     out_f = None
     err_f = None
     try:
         out_f = open(stdout_log, "a")
         err_f = open(stderr_log, "a")
-        ts = datetime.now().isoformat()
-        marker = f"\n=== [{ts}] [watch restart] {' '.join(command)} ===\n"
-        out_f.write(marker)
-        err_f.write(marker)
-        out_f.flush()
-        err_f.flush()
         proc = subprocess.Popen(
             command,
             stdout=out_f,

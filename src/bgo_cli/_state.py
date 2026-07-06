@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Default storage layout. Tests override these by monkeypatching the
@@ -52,11 +52,30 @@ def watcher_log_path(name: str) -> Path:
 def watcher_log(name: str, msg: str) -> None:
     """Append one timestamped line to the watcher log. Never raises."""
     try:
-        ts = datetime.now().isoformat(timespec="seconds")
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with open(watcher_log_path(name), "a") as f:
             f.write(f"[{ts}] {msg}\n")
     except OSError:
         pass
+
+
+def write_start_markers(
+    name: str, command: list[str], tag: str = "Starting"
+) -> tuple[Path, Path]:
+    """Append a timestamped start marker to stdout and stderr logs.
+
+    Returns the two log paths so the caller can re-open them for the
+    process. The marker uses UTC ISO timestamps to match ``started_at``
+    and ``stopped_at``.
+    """
+    stdout_log = log_path(name, "out")
+    stderr_log = log_path(name, "err")
+    ts = datetime.now(timezone.utc).isoformat()
+    marker = f"\n=== [{ts}] [{tag}] {' '.join(command)} ===\n"
+    for lf in (stdout_log, stderr_log):
+        with open(lf, "a") as f:
+            f.write(marker)
+    return stdout_log, stderr_log
 
 
 def load_proc(name: str) -> dict | None:

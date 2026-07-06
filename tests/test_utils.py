@@ -1,5 +1,6 @@
 """Pure utility tests: command-shape detection, name derivation, liveness."""
 
+import argparse
 import os
 import sys
 import time
@@ -28,6 +29,11 @@ def test_looks_like_command_resolved_via_which(bgo):
 
 def test_looks_like_command_plain_name_not_executable(bgo):
     assert bgo._looks_like_command("myapp") is False
+
+
+def test_looks_like_command_dotted_name_is_not_command(bgo):
+    """Dotted process names like 'my.app' must not look like executables."""
+    assert bgo._looks_like_command("my.app") is False
 
 
 # --- derive_name ---
@@ -185,3 +191,67 @@ def test_tail_stderr_strips_leading_partial_line(bgo):
     tail = bgo._tail_stderr("demo", nbytes=8)
     # Should not include the truncated "aa" prefix
     assert not tail.startswith("aaaa")
+
+
+# --- autostart policy ---
+
+
+def test_start_stores_default_autostart_policy(bgo, monkeypatch):
+    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    bgo.cmd_start(
+        argparse.Namespace(
+            name="demo",
+            command=["python3", "-c", "import time; time.sleep(30)"],
+            cwd=None,
+            watch=False,
+            interval=None,
+            min_uptime=None,
+            on_fast_crash=None,
+            autostart=None,
+        )
+    )
+    info = bgo.load_proc("demo")
+    assert info["autostart"] == bgo.AUTOSTART_DEFAULT
+    bgo.cmd_stop(argparse.Namespace(name="demo", force=True))
+
+
+def test_start_honors_explicit_autostart_policy(bgo, monkeypatch):
+    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    bgo.cmd_start(
+        argparse.Namespace(
+            name="demo",
+            command=["python3", "-c", "import time; time.sleep(30)"],
+            cwd=None,
+            watch=False,
+            interval=None,
+            min_uptime=None,
+            on_fast_crash=None,
+            autostart="never",
+        )
+    )
+    info = bgo.load_proc("demo")
+    assert info["autostart"] == "never"
+    bgo.cmd_stop(argparse.Namespace(name="demo", force=True))
+
+
+def test_resurrect_respects_autostart_policy(bgo, monkeypatch, capsys):
+    bgo.save_proc("always", {"name": "always", "pid": 1, "status": "running", "command": ["true"], "autostart": "always"})
+    bgo.save_proc("unless", {"name": "unless", "pid": 2, "status": "running", "command": ["true"], "autostart": "unless-stopped"})
+    bgo.save_proc("stopped", {"name": "stopped", "pid": 3, "status": "stopped", "command": ["true"], "autostart": "unless-stopped"})
+    bgo.save_proc("never", {"name": "never", "pid": 4, "status": "running", "command": ["true"], "autostart": "never"})
+
+    started: list[str] = []
+    monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args.name) or 0)
+
+    bgo.cmd_resurrect(argparse.Namespace())
+    assert set(started) == {"always", "unless"}
+
+
+def test_autostart_set_and_show(bgo, capsys):
+    bgo.save_proc("demo", {"name": "demo", "pid": 1, "status": "running", "command": ["true"]})
+
+    bgo.cmd_autostart(argparse.Namespace(action="set", name="demo", policy="never"))
+    assert bgo.load_proc("demo")["autostart"] == "never"
+
+    bgo.cmd_autostart(argparse.Namespace(action="show", name="demo"))
+    assert "autostart=never" in capsys.readouterr().out

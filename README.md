@@ -21,6 +21,8 @@ PyPI: <https://pypi.org/project/bgo-cli/>
 - **Watch mode** — auto-restart crashed processes with fast-crash backoff
 - **Desktop notifications** on errored transitions
 - **Login autostart** via systemd-user (Linux) or LaunchAgent (macOS)
+- **Per-proc autostart policy** — `always`, `unless-stopped` (default),
+  or `never`; controls what `bgo resurrect` brings back at login
 - **Tray icon** (optional) — PySide6, gear+dot status indicator,
   KDE/Hyprland/GNOME/macOS
 - **Scriptable** — `--json` output for any pipeline
@@ -36,6 +38,10 @@ bgo ls
 bgo logs myserver -f
 bgo restart myserver
 bgo stop myserver
+
+# Control login autostart behavior
+bgo autostart set myserver never
+bgo autostart install            # run bgo resurrect at login
 ```
 
 `bgo` with no args prints help. `bgo <unknown>` errors out rather than
@@ -90,10 +96,11 @@ Full layout: [docs/architecture.md](docs/architecture.md#storage-layout).
 uv run pytest tests/ -v
 ```
 
-169 tests covering state I/O, atomic writes, command-shape detection,
+227 tests covering state I/O, atomic writes, command-shape detection,
 name derivation, liveness + zombie filtering, watch-config inheritance,
-table rendering, desktop notifications, login autostart, and tray menu
-construction.
+watch loop behavior, table rendering, desktop notifications, login
+autostart, autostart policy, direct-mode parsing, core command handlers,
+and tray menu construction.
 
 ## Requirements
 

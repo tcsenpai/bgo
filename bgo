@@ -31,6 +31,7 @@ from bgo_cli._state import (  # noqa: E402
     log_path,
     watcher_log_path,
     watcher_log,
+    write_start_markers,
     load_proc,
     save_proc,
     delete_proc,
@@ -87,6 +88,10 @@ from bgo_cli._watcher import (  # noqa: E402
 )
 
 
+AUTOSTART_POLICIES = ("always", "unless-stopped", "never")
+AUTOSTART_DEFAULT = "unless-stopped"
+
+
 # --- Commands ---
 
 
@@ -127,19 +132,10 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     command = resolve_command(command)
 
-    # Prepare log files
-    stdout_log = log_path(name, "out")
-    stderr_log = log_path(name, "err")
+    # Prepare log files and write start marker
+    stdout_log, stderr_log = write_start_markers(name, command, tag="Starting")
 
     with open(stdout_log, "a") as out_f, open(stderr_log, "a") as err_f:
-        # Write start marker
-        timestamp = datetime.now().isoformat()
-        marker = f"\n=== [{timestamp}] Starting: {' '.join(command)} ===\n"
-        out_f.write(marker)
-        err_f.write(marker)
-        out_f.flush()
-        err_f.flush()
-
         try:
             process = subprocess.Popen(
                 command,
@@ -185,6 +181,15 @@ def cmd_start(args: argparse.Namespace) -> int:
         prior_watch=prior_watch,
     )
 
+    # Determine autostart policy. Fresh starts default to
+    # unless-stopped; restarts preserve the existing policy unless the
+    # caller explicitly overrides it.
+    autostart = getattr(args, "autostart", None)
+    if autostart is None and existing:
+        autostart = existing.get("autostart")
+    if autostart is None:
+        autostart = AUTOSTART_DEFAULT
+
     info = {
         "name": name,
         "pid": process.pid,
@@ -193,6 +198,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "cwd": args.cwd or os.getcwd(),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "status": "running",
+        "autostart": autostart,
     }
     if watch_block:
         info["watch"] = watch_block
@@ -311,11 +317,18 @@ def cmd_restart(args: argparse.Namespace) -> int:
         print(f"🛑 Stopping '{name}'...")
         kill_process(pid, info.get("pgid"))
 
-    # cmd_start picks up info["watch"] via load_proc(existing) and re-spawns watcher
+    # cmd_start picks up info["watch"] via load_proc(existing) and re-spawns watcher.
+    # Explicit watch-related fields keep the namespace stable even if
+    # cmd_start's defaults change.
     restart_args = argparse.Namespace(
         name=name,
         command=info["command"],
         cwd=info.get("cwd"),
+        watch=False,
+        interval=None,
+        min_uptime=None,
+        on_fast_crash=None,
+        autostart=info.get("autostart"),
     )
     return cmd_start(restart_args)
 
@@ -425,12 +438,13 @@ def _clear_screen() -> None:
         sys.stdout.flush()
 
 
-def _status_snapshot(procs: dict) -> list[dict]:
+def _status_snapshot(procs: dict, persist: bool = True) -> list[dict]:
     """Build a status snapshot for procs. Returns list of dicts keyed by name.
 
-    Pure: no printing. Side effect: persists status='stopped' for procs
-    whose pid is no longer running, so subsequent status calls stay
-    consistent. Batches the ps lookup into a single subprocess call.
+    Pure: no printing. When ``persist`` is True, dead procs get
+    ``status='stopped'`` written back so subsequent status calls stay
+    consistent. Callers that only read (e.g. ``--json``) should pass
+    ``persist=False``. Batches the ps lookup into a single subprocess call.
     """
     running_pids = []
     for info in procs.values():
@@ -447,7 +461,7 @@ def _status_snapshot(procs: dict) -> list[dict]:
             pinfo = pinfo_map.get(pid, dict(_BLANK_PINFO))
         else:
             pinfo = dict(_BLANK_PINFO)
-            if info.get("status") != "stopped":
+            if persist and info.get("status") != "stopped":
                 info["status"] = "stopped"
                 save_proc(name, info)
         rows.append({
@@ -615,10 +629,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             if not info:
                 print(json.dumps({"error": f"no process named '{args.name}'"}))
                 return 1
-            rows = _status_snapshot({args.name: info})
+            rows = _status_snapshot({args.name: info}, persist=False)
             print(json.dumps(rows[0], indent=2, default=str))
             return 0
-        rows = _status_snapshot(procs)
+        rows = _status_snapshot(procs, persist=False)
         print(json.dumps(rows, indent=2, default=str))
         return 0
 
@@ -685,6 +699,7 @@ def _print_proc_detail(info: dict) -> None:
     print(f"  Command: {' '.join(info['command'])}")
     print(f"  CWD:     {info.get('cwd', 'N/A')}")
     print(f"  Started: {info.get('started_at', 'N/A')}")
+    print(f"  Autostart: {info.get('autostart', AUTOSTART_DEFAULT)}")
 
     if running:
         proc_info = get_process_info(pid)
@@ -879,11 +894,17 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 
 def cmd_resurrect(args: argparse.Namespace) -> int:
-    """Restart every proc whose last recorded status was ``running``.
+    """Restart procs eligible for login/boot autostart.
+
+    Respects the per-proc ``autostart`` policy:
+
+    * ``always``          — restart unless already running.
+    * ``unless-stopped``  — restart unless the user explicitly stopped
+                            it (``status == "stopped"``).
+    * ``never``           — never restart.
 
     Used by the systemd / launchd autostart entry to bring back
-    managed procs after a reboot or session login. Procs that the
-    user manually stopped (status=stopped) are left alone.
+    managed procs after a reboot or session login.
 
     :returns: 0 if all candidates restarted (or none existed), 1 if
               any failed to start.
@@ -897,11 +918,17 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
     candidates = []
     for name, info in procs.items():
         pid = info.get("pid")
-        if not is_running(pid) and info.get("status") == "running":
-            candidates.append((name, info))
+        if is_running(pid):
+            continue
+        policy = info.get("autostart", AUTOSTART_DEFAULT)
+        if policy == "never":
+            continue
+        if policy == "unless-stopped" and info.get("status") == "stopped":
+            continue
+        candidates.append((name, info))
 
     if not candidates:
-        print("No processes to resurrect (all running or already stopped).")
+        print("No processes to resurrect (all running, stopped, or disabled).")
         return 0
 
     print(f"🔄 Resurrecting {len(candidates)} process(es)...")
@@ -912,6 +939,11 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
             name=name,
             command=info["command"],
             cwd=info.get("cwd"),
+            watch=False,
+            interval=None,
+            min_uptime=None,
+            on_fast_crash=None,
+            autostart=info.get("autostart"),
         )
         result = cmd_start(restart_args)
         if result != 0:
@@ -1207,16 +1239,21 @@ def cmd_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_autostart(args: argparse.Namespace) -> int:
-    """Install / uninstall / inspect login autostart for ``bgo resurrect``.
+    """Login autostart management.
 
-    Subcommands (``args.action``):
-        install   — write the unit and enable it.
-        uninstall — disable and remove the unit.
-        status    — print install state as table or JSON.
+    Two concerns live here:
 
-    The ``--tray`` flag pivots all three actions to the tray entry
-    instead of the resurrect entry. Both can be installed; they're
-    independent.
+    1. Installing/uninstalling the login hook that runs
+       ``bgo resurrect`` (and optionally the tray) at session start.
+       Actions: ``install``, ``uninstall``, ``status``.
+
+    2. Setting/showing the per-process autostart policy that tells
+       ``bgo resurrect`` which procs to bring back.
+       Actions: ``set``, ``show``.
+
+    The ``--tray`` flag pivots ``install/uninstall/status`` to the tray
+    entry instead of the resurrect entry. Both can be installed;
+    they're independent.
     """
     try:
         from bgo_cli import _autostart
@@ -1224,8 +1261,37 @@ def cmd_autostart(args: argparse.Namespace) -> int:
         print(f"{color('red', '❌')} autostart module unavailable: {exc}")
         return 1
 
-    target = "tray" if getattr(args, "tray", False) else "resurrect"
     action = args.action
+
+    if action == "set":
+        name = args.name
+        policy = args.policy
+        info = load_proc(name)
+        if not info:
+            print(f"{color('red', '❌')} No process named '{name}' found")
+            return 1
+        if policy not in AUTOSTART_POLICIES:
+            print(
+                f"{color('red', '❌')} Invalid autostart policy '{policy}'. "
+                f"Choose one of: {', '.join(AUTOSTART_POLICIES)}"
+            )
+            return 1
+        info["autostart"] = policy
+        save_proc(name, info)
+        print(f"{color('green', '✅')} Autostart policy for '{name}' set to '{policy}'")
+        return 0
+
+    if action == "show":
+        name = args.name
+        info = load_proc(name)
+        if not info:
+            print(f"{color('red', '❌')} No process named '{name}' found")
+            return 1
+        policy = info.get("autostart", AUTOSTART_DEFAULT)
+        print(f"{name}: autostart={policy}")
+        return 0
+
+    target = "tray" if getattr(args, "tray", False) else "resurrect"
 
     if action == "status":
         s = _autostart.status()
@@ -1334,15 +1400,15 @@ def main() -> int:
     # status detail if it names a registered proc, or prints help.
     # Direct-mode start requires either an explicit '--' separator, a -w
     # flag, OR at least 2 positional tokens (name + command).
+    route_to_argparse = False
     if len(sys.argv) > 1 and sys.argv[1] not in known_commands:
         remaining = sys.argv[1:]
 
-        # Single arg → status detail if registered, else help
+        # Single arg → status detail if registered, else argparse for flags/help
         if len(remaining) == 1 and remaining[0] not in ("-w", "--watch"):
             tok = remaining[0]
             if tok.startswith("-"):
-                # Unknown flag — argparse handles it (prints error + usage)
-                pass
+                route_to_argparse = True
             elif load_proc(tok) is not None:
                 args = argparse.Namespace(name=tok, watch=False, json=False, interval=None)
                 return cmd_status(args)
@@ -1352,60 +1418,63 @@ def main() -> int:
                       f"{color('bold', 'bgo start ' + tok + ' -- <command>')} to start a new process.")
                 return 1
 
-        # Strip -w / --watch in head (positions before '--', or first two positions if no '--').
-        want_watch = False
-        if "--" in remaining:
-            sep = remaining.index("--")
-            head, tail = remaining[:sep], remaining[sep:]
-            new_head = []
-            for tok in head:
-                if tok in ("-w", "--watch"):
-                    want_watch = True
-                else:
-                    new_head.append(tok)
-            remaining = new_head + tail
-        else:
-            new_remaining = []
-            for idx, tok in enumerate(remaining):
-                if idx < 2 and tok in ("-w", "--watch"):
-                    want_watch = True
-                    continue
-                new_remaining.append(tok)
-            remaining = new_remaining
+        if not route_to_argparse:
+            # Strip -w / --watch in head (positions before '--', or first two positions if no '--').
+            want_watch = False
+            if "--" in remaining:
+                sep = remaining.index("--")
+                head, tail = remaining[:sep], remaining[sep:]
+                new_head = []
+                for tok in head:
+                    if tok in ("-w", "--watch"):
+                        want_watch = True
+                    else:
+                        new_head.append(tok)
+                remaining = new_head + tail
+            else:
+                new_remaining = []
+                for idx, tok in enumerate(remaining):
+                    if idx < 2 and tok in ("-w", "--watch"):
+                        want_watch = True
+                        continue
+                    new_remaining.append(tok)
+                remaining = new_remaining
 
-        if not remaining:
-            print("Usage: bgo <n> -- <command> [args...]")
-            return 1
-
-        # Check if there's a '--' separator → explicit name mode
-        if "--" in remaining:
-            sep_idx = remaining.index("--")
-            name = remaining[0] if sep_idx > 0 else None
-            command = remaining[sep_idx + 1 :]
-
-            if not name or not command:
-                print("Usage: bgo [-w] <n> -- <command> [args...]")
+            if not remaining:
+                print("Usage: bgo <n> -- <command> [args...]")
                 return 1
 
-            args = argparse.Namespace(
-                name=name, command=command, cwd=None, watch=want_watch,
-                interval=None, min_uptime=None, on_fast_crash=None,
-            )
-            return cmd_start(args)
-        else:
-            # No '--' → heuristic: if first arg is NOT an executable but
-            # second arg IS (or looks like a path/command), treat first as name.
-            if len(remaining) >= 2 and not _looks_like_command(remaining[0]) and _looks_like_command(remaining[1]):
-                name = remaining[0]
-                command = remaining[1:]
+            # Check if there's a '--' separator → explicit name mode
+            if "--" in remaining:
+                sep_idx = remaining.index("--")
+                name = remaining[0] if sep_idx > 0 else None
+                command = remaining[sep_idx + 1 :]
+
+                if not name or not command:
+                    print("Usage: bgo [-w] <n> -- <command> [args...]")
+                    return 1
+
+                args = argparse.Namespace(
+                    name=name, command=command, cwd=None, watch=want_watch,
+                    interval=None, min_uptime=None, on_fast_crash=None,
+                    autostart=None,
+                )
+                return cmd_start(args)
             else:
-                command = remaining
-                name = derive_name(command)
-            args = argparse.Namespace(
-                name=name, command=command, cwd=None, watch=want_watch,
-                interval=None, min_uptime=None, on_fast_crash=None,
-            )
-            return cmd_start(args)
+                # No '--' → heuristic: if first arg is NOT an executable but
+                # second arg IS (or looks like a path/command), treat first as name.
+                if len(remaining) >= 2 and not _looks_like_command(remaining[0]) and _looks_like_command(remaining[1]):
+                    name = remaining[0]
+                    command = remaining[1:]
+                else:
+                    command = remaining
+                    name = derive_name(command)
+                args = argparse.Namespace(
+                    name=name, command=command, cwd=None, watch=want_watch,
+                    interval=None, min_uptime=None, on_fast_crash=None,
+                    autostart=None,
+                )
+                return cmd_start(args)
 
     parser = argparse.ArgumentParser(
         prog="bgo",
@@ -1413,9 +1482,10 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  bgo python3 server.py                    # Start (auto-name: 'server')
+  bgo python3 server.py                    # Start (auto-name: 'python3')
   bgo myapp python3 server.py --port 8080  # Start with name + args
   bgo start myapp -- python3 server.py     # Start with explicit name
+  bgo start myapp --autostart never -- python3 server.py
   bgo open myapp -- python3 server.py      # Alias for start
   bgo myapp -- ./api-server --port 8080    # Shorthand with name
   bgo status                               # Show all processes
@@ -1435,7 +1505,9 @@ Examples:
   bgo delete myapp                         # Remove from list + logs
   bgo rm myapp                             # Alias for delete
   bgo clean                                # Remove all stopped entries
-  bgo resurrect                            # Restart all previously running procs
+  bgo resurrect                            # Restart autostart-enabled procs
+  bgo autostart set myapp never            # Disable autostart for myapp
+  bgo autostart show myapp                 # Show myapp's autostart policy
 
 Watch mode (auto-restart on crash):
   bgo start -w myapp -- python3 server.py  # Start with watcher
@@ -1474,6 +1546,12 @@ Watch mode (auto-restart on crash):
         "--on-fast-crash", dest="on_fast_crash",
         choices=["backoff", "stop", "retry"], default=None,
         help=f"Fast-crash policy (default: {WATCH_DEFAULTS['on_fast_crash']})",
+    )
+    start_parser.add_argument(
+        "--autostart",
+        choices=AUTOSTART_POLICIES,
+        default=None,
+        help=f"Autostart policy for login resurrection (default: {AUTOSTART_DEFAULT})",
     )
 
     # stop
@@ -1637,6 +1715,19 @@ Watch mode (auto-restart on crash):
     sp_status.add_argument(
         "--json", action="store_true", help="Machine-readable output",
     )
+    sp_set = autostart_sub.add_parser(
+        "set", help="Set a process autostart policy"
+    )
+    sp_set.add_argument("name", help="Name of the process")
+    sp_set.add_argument(
+        "policy",
+        choices=AUTOSTART_POLICIES,
+        help="autostart policy: always | unless-stopped | never",
+    )
+    sp_show = autostart_sub.add_parser(
+        "show", help="Show a process autostart policy"
+    )
+    sp_show.add_argument("name", help="Name of the process")
 
     # tray (optional extra)
     tray_parser = subparsers.add_parser(
