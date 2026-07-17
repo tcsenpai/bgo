@@ -28,7 +28,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from bgo_cli._proc import is_running, kill_process
+from bgo_cli._proc import _probe_pid_start, is_running, kill_process
 from bgo_cli._state import (
     load_proc,
     log_path,
@@ -294,13 +294,17 @@ def cmd_watcher_loop(name: str) -> int:
         if not w.get("enabled"):
             watcher_log(name, "watch disabled; exiting")
             return 0
-        if info.get("status") == "stopped":
+        if (
+            info.get("status") == "stopped"
+            and info.get("stop_reason", "user") == "user"
+        ):
             watcher_log(name, "proc manually stopped; exiting")
             return 0
 
         pid = info.get("pid")
         if is_running(pid):
             continue
+        pid_start = info.get("pid_start")
 
         # Process died. Compute uptime.
         try:
@@ -325,6 +329,7 @@ def cmd_watcher_loop(name: str) -> int:
                 info["watch"]["watcher_pid"] = None
                 info["watch"]["watcher_pgid"] = None
                 info["status"] = "stopped"
+                info["stop_reason"] = "crashed"
                 save_proc(name, info)
                 watcher_log(name, "errored; exiting")
                 _notify_errored(name, reason)
@@ -341,6 +346,7 @@ def cmd_watcher_loop(name: str) -> int:
                     info["watch"]["watcher_pid"] = None
                     info["watch"]["watcher_pgid"] = None
                     info["status"] = "stopped"
+                    info["stop_reason"] = "crashed"
                     save_proc(name, info)
                     watcher_log(name, "backoff exhausted; errored; exiting")
                     _notify_errored(name, reason)
@@ -361,15 +367,32 @@ def cmd_watcher_loop(name: str) -> int:
         else:
             backoff_idx = 0
 
-        # Reload (state may have shifted during sleep).
+        # Reload (state may have shifted during sleep) and re-verify
+        # before restarting: the death we observed may be stale news.
         info = load_proc(name)
-        if (
-            not info
-            or info.get("status") == "stopped"
-            or not info.get("watch", {}).get("enabled")
-        ):
+        if not info or not info.get("watch", {}).get("enabled"):
             watcher_log(name, "state changed during backoff; exiting")
             return 0
+        if (
+            info.get("status") == "stopped"
+            and info.get("stop_reason", "user") == "user"
+        ):
+            watcher_log(name, "proc stopped by user during backoff; exiting")
+            return 0
+        if info.get("pid") != pid or (
+            pid_start
+            and info.get("pid_start")
+            and info.get("pid_start") != pid_start
+        ):
+            # Another start/resurrect replaced the proc; its own
+            # watcher (if any) owns it now.
+            watcher_log(name, "proc restarted elsewhere; exiting")
+            return 0
+        if is_running(pid, expected_start=info.get("pid_start")):
+            # The recorded pid is alive again (e.g. transient zombie
+            # misread); keep monitoring instead of double-restarting.
+            watcher_log(name, "pid alive again; resuming monitoring")
+            continue
 
         new_pid, new_pgid, err = _restart_proc_inplace(info)
         if err:
@@ -380,6 +403,7 @@ def cmd_watcher_loop(name: str) -> int:
             info["watch"]["watcher_pid"] = None
             info["watch"]["watcher_pgid"] = None
             info["status"] = "stopped"
+            info["stop_reason"] = "crashed"
             save_proc(name, info)
             _notify_errored(name, err)
             return 0
@@ -389,6 +413,14 @@ def cmd_watcher_loop(name: str) -> int:
         info["pgid"] = new_pgid
         info["started_at"] = now_iso
         info["status"] = "running"
+        # A successful (re)start clears stop_reason and records the new
+        # pid's start time for identity checks, mirroring cmd_start.
+        info.pop("stop_reason", None)
+        new_pid_start = _probe_pid_start(new_pid)
+        if new_pid_start:
+            info["pid_start"] = new_pid_start
+        else:
+            info.pop("pid_start", None)
         info["watch"]["restarts"] = info["watch"].get("restarts", 0) + 1
         info["watch"]["last_restart_at"] = now_iso
         save_proc(name, info)

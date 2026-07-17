@@ -9,7 +9,7 @@ quickstart and feature overview that links here for detail.
 ### Getting started
 
 - **[Installation](installation.md)** — uv (recommended), pipx, pip,
-  install.sh, manual single-file copy.
+  install.sh, source checkout.
 - **[Commands](commands.md)** — full CLI reference: lifecycle,
   inspection, watch mode, autostart, tray.
 

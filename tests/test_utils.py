@@ -197,7 +197,7 @@ def test_tail_stderr_strips_leading_partial_line(bgo):
 
 
 def test_start_stores_default_autostart_policy(bgo, monkeypatch):
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
     bgo.cmd_start(
         argparse.Namespace(
             name="demo",
@@ -216,7 +216,7 @@ def test_start_stores_default_autostart_policy(bgo, monkeypatch):
 
 
 def test_start_honors_explicit_autostart_policy(bgo, monkeypatch):
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
     bgo.cmd_start(
         argparse.Namespace(
             name="demo",

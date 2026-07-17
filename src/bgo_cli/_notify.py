@@ -152,8 +152,10 @@ def notify(title: str, body: str, level: Level = "info") -> bool:
 
     try:
         argv = _format_argv(template, title, body, kind)
-    except (KeyError, IndexError):
-        # Malformed override template — placeholders missing.
+    except (KeyError, IndexError, ValueError, AttributeError):
+        # Malformed override template — unknown placeholder, missing
+        # positional index, broken format syntax (e.g. a stray brace),
+        # or bad attribute access on the substituted values.
         return False
 
     try:

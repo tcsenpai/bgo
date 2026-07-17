@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -60,10 +61,10 @@ class ProcSnapshot:
 class MenuSpec:
     """Declarative description of the tray menu.
 
-    The ``run`` layer translates this into ``pystray.Menu`` objects;
-    tests inspect the spec directly. Keeping this layer
-    framework-agnostic means swapping pystray for another toolkit in
-    the future touches only ``_run_tray``.
+    The ``_run_tray`` layer translates this into ``QMenu``/``QAction``
+    objects; tests inspect the spec directly. Keeping this layer
+    framework-agnostic means swapping Qt for another toolkit in the
+    future touches only ``_run_tray``.
     """
 
     title: str
@@ -143,7 +144,7 @@ def _status_glyph(snap: ProcSnapshot) -> str:
 def build_menu_spec(snapshots: Iterable[ProcSnapshot]) -> MenuSpec:
     """Render snapshots into a :class:`MenuSpec` for the toolkit layer.
 
-    Side-effect-free; safe to call in tests without pystray installed.
+    Side-effect-free; safe to call in tests without PySide6 installed.
     """
     procs = list(snapshots)
     online = sum(1 for s in procs if s.status == "running" and not s.errored)
@@ -190,6 +191,23 @@ def run_bgo(*args: str) -> int:
     except (subprocess.SubprocessError, OSError):
         return 127
     return proc.returncode
+
+
+def _run_bgo_in_thread(*args: str, on_done: Callable[[int], None]) -> threading.Thread:
+    """Run :func:`run_bgo` on a daemon thread; call ``on_done(rc)`` when done.
+
+    Tray action slots use this so a slow ``bgo`` invocation (up to the
+    20 s timeout) never blocks the Qt GUI thread. ``on_done`` fires on
+    the worker thread — callers must marshal back to the GUI thread
+    themselves (``_run_tray`` wires it to a ``Signal.emit``, which Qt
+    queue-delivers to the GUI thread).
+    """
+    def work() -> None:
+        on_done(run_bgo(*args))
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+    return thread
 
 
 # Ordered preferences for graphical terminal emulators. We pick the
@@ -438,7 +456,7 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
     import signal
 
     try:
-        from PySide6.QtCore import QByteArray, QTimer
+        from PySide6.QtCore import QByteArray, QObject, QTimer, Signal
         from PySide6.QtGui import QAction, QIcon, QPixmap
         from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
         from PySide6.QtSvg import QSvgRenderer
@@ -482,6 +500,32 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
     # closure-captured list survives garbage collection of the locals.
     held: list[object] = []
 
+    # --- Async action dispatch ------------------------------------------
+    # ``run_bgo`` blocks for up to its 20 s timeout; calling it from a
+    # QAction slot would freeze the menu and icon for the duration. Run
+    # it on a daemon thread and marshal the exit code back through a Qt
+    # Signal (thread-safe: Qt queue-delivers it to the GUI thread, where
+    # ``bridge`` lives). While one action is in flight, further triggers
+    # are dropped — the forced rebuild on completion reflects the result.
+    class _ActionBridge(QObject):
+        finished = Signal(int)
+
+    bridge = _ActionBridge()
+    action_busy = {"in_flight": False}
+
+    def on_action_done(_rc: int) -> None:
+        action_busy["in_flight"] = False
+        rebuild(force=True)
+
+    bridge.finished.connect(on_action_done)
+    held.append(bridge)
+
+    def run_bgo_action(*args: str) -> None:
+        if action_busy["in_flight"]:
+            return
+        action_busy["in_flight"] = True
+        _run_bgo_in_thread(*args, on_done=bridge.finished.emit)
+
     def make_proc_submenu(snap: ProcSnapshot, parent: QMenu) -> QMenu:
         # ``bgo start <name>`` without a command is rejected by the
         # core CLI (start requires REMAINDER). For a registered proc
@@ -493,11 +537,11 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
         primary_label = "Restart" if is_running else "Start"
 
         primary = QAction(primary_label, sub)
-        primary.triggered.connect(lambda *_: run_bgo("restart", snap.name))
+        primary.triggered.connect(lambda *_: run_bgo_action("restart", snap.name))
         sub.addAction(primary)
 
         stop = QAction("Stop", sub)
-        stop.triggered.connect(lambda *_: run_bgo("stop", snap.name))
+        stop.triggered.connect(lambda *_: run_bgo_action("stop", snap.name))
         sub.addAction(stop)
 
         sub.addSeparator()
@@ -532,7 +576,7 @@ def _run_tray(poll_seconds: int) -> int:  # pragma: no cover — needs Qt
             elif cmd == "__refresh__":
                 act.triggered.connect(lambda *_: rebuild(force=True))
             else:
-                act.triggered.connect(lambda *_, c=cmd: run_bgo(c))
+                act.triggered.connect(lambda *_, c=cmd: run_bgo_action(c))
             menu.addAction(act)
             held.append(act)
 

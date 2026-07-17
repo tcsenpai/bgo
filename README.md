@@ -53,7 +53,7 @@ Long-form docs live in [`docs/`](docs/README.md):
 
 | Topic | Where |
 |---|---|
-| Install paths (uv / pipx / pip / install.sh / manual) | [docs/installation.md](docs/installation.md) |
+| Install paths (uv / pipx / pip / install.sh / source checkout) | [docs/installation.md](docs/installation.md) |
 | Full CLI reference | [docs/commands.md](docs/commands.md) |
 | Watch mode (auto-restart + fast-crash policy) | [docs/watch-mode.md](docs/watch-mode.md) |
 | Desktop notifications | [docs/notifications.md](docs/notifications.md) |

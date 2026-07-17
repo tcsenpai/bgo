@@ -178,6 +178,29 @@ def test_run_bgo_falls_back_to_argv0_when_which_misses(
     assert run.call_args.args[0][0] == str(fake.resolve())
 
 
+# --- _run_bgo_in_thread ---------------------------------------------------
+
+
+def test_run_bgo_in_thread_reports_rc_via_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker thread runs run_bgo with the given args and hands the
+    exit code to ``on_done`` — the seam the Qt Signal bridge relies on."""
+    seen: dict[str, object] = {}
+
+    def fake_run_bgo(*args: str) -> int:
+        seen["args"] = args
+        return 42
+
+    monkeypatch.setattr(_tray, "run_bgo", fake_run_bgo)
+    results: list[int] = []
+    thread = _tray._run_bgo_in_thread("restart", "web", on_done=results.append)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert seen["args"] == ("restart", "web")
+    assert results == [42]
+
+
 # --- _resolve_terminal --------------------------------------------------
 
 

@@ -129,5 +129,6 @@ See [Login autostart](autostart.md) for details.
 |---|---|---|
 | `--poll N`, `BGO_TRAY_POLL` | `3` | Snapshot refresh interval (seconds) |
 | `--auto-install`, `BGO_TRAY_AUTOINSTALL=1` | off | Skip the install prompt |
+| `BGO_TRAY_AUTOINSTALL_DONE` | unset | Internal sentinel: set before the post-install re-exec so a still-failing import prints manual instructions instead of looping |
 | `BGO_TERMINAL` | (auto-probe) | Terminal emulator for Open-logs |
 | `BGO_TRAY_DEBUG=1` | off | Log activation reasons to stderr |

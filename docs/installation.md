@@ -1,7 +1,8 @@
 # Installation
 
-bgo is a single-file Python 3.10+ script with zero runtime
-dependencies. Several install paths exist; pick the one that matches
+bgo is a Python 3.10+ package (`bgo-cli`) with zero runtime
+dependencies. Installing the package puts the `bgo` command on your
+`$PATH`. Several install paths exist; pick the one that matches
 how you usually install Python CLIs.
 
 ## Recommended: `uv`
@@ -39,25 +40,35 @@ pip install 'bgo-cli[tray]'    # with tray extra
 pip install --user bgo-cli     # user site-packages
 ```
 
-## install.sh (no PyPI)
+## install.sh
 
-The `install.sh` shipped in the repo copies the single-file `bgo`
-script to a target directory. No build, no Python packaging.
-
-```bash
-./install.sh             # /usr/local/bin (needs sudo)
-./install.sh --local     # ~/.local/bin (no sudo)
-./install.sh --help      # --force / --uninstall
-```
-
-## Fully manual
-
-Because `bgo` is a single executable Python file:
+The `install.sh` shipped in the repo installs the package for you,
+picking the first available tool — `uv tool install`, then `pipx`,
+then `pip --user`. Run from inside the repo it installs from local
+source; run from anywhere else it installs the `bgo-cli` release
+from PyPI. No sudo needed.
 
 ```bash
-cp bgo ~/.local/bin/                       # or any PATH dir
-ln -s "$(pwd)/bgo" ~/.local/bin/bgo        # symlink to a checkout
+./install.sh              # install for the current user
+./install.sh --force      # reinstall over an existing install
+./install.sh --uninstall  # remove the installed package
+./install.sh --help       # all flags
 ```
+
+## From a source checkout
+
+To install from a clone (e.g. to hack on bgo):
+
+```bash
+git clone https://github.com/tcsenpai/bgo.git
+cd bgo
+uv tool install .            # or: pipx install . / pip install --user .
+```
+
+> Note: the repo-root `bgo` script is **not** standalone — it imports
+> the `bgo_cli` package at startup. Copying it into a bin dir
+> (`cp bgo ~/.local/bin/`) produces a broken binary; always install
+> the package.
 
 ## Verify
 

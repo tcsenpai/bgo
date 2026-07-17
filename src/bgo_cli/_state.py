@@ -34,18 +34,35 @@ def init_dirs() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def validate_name(name: str) -> str:
+    """Return ``name`` if usable as a proc identifier, else raise ValueError.
+
+    Names become file stems under ``PROCS_DIR`` / ``LOGS_DIR``, so reject
+    anything that could escape those directories (path separators, dot
+    segments) or corrupt output (control characters, empty).
+    """
+    if not name or name in (".", ".."):
+        raise ValueError(f"invalid process name: {name!r}")
+    if "/" in name or "\\" in name or not name.isprintable():
+        raise ValueError(f"invalid process name: {name!r}")
+    return name
+
+
 def proc_file(name: str) -> Path:
     """Path of the JSON state file for ``name``."""
+    validate_name(name)
     return PROCS_DIR / f"{name}.json"
 
 
 def log_path(name: str, stream: str = "out") -> Path:
     """Path of the stdout / stderr log file for ``name``."""
+    validate_name(name)
     return LOGS_DIR / f"{name}.{stream}.log"
 
 
 def watcher_log_path(name: str) -> Path:
     """Path of the watcher event log file for ``name``."""
+    validate_name(name)
     return LOGS_DIR / f"{name}.watcher.log"
 
 
@@ -144,7 +161,7 @@ def load_all_procs() -> dict[str, dict]:
 
 __all__ = [
     "BGO_DIR", "PROCS_DIR", "LOGS_DIR",
-    "init_dirs",
+    "init_dirs", "validate_name",
     "proc_file", "log_path", "watcher_log_path", "watcher_log",
     "load_proc", "save_proc", "delete_proc", "load_all_procs",
 ]

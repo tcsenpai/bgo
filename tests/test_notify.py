@@ -217,3 +217,28 @@ def test_notify_unknown_level_treated_as_info() -> None:
     with mock.patch.dict(_notify.os.environ, {"BGO_NOTIFY": "errors"}, clear=False):
         # info doesn't pass 'errors' gate => returns False without backend
         assert _notify.notify("t", "b", "garbage") is False  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "ntfy } {title}",   # stray close brace -> ValueError
+        "ntfy { {title}",   # stray open brace -> ValueError
+        "ntfy {title:zz}",  # invalid format spec -> ValueError
+        "ntfy {title.foo}", # bad attribute access -> AttributeError
+        "ntfy {missing}",   # unknown placeholder -> KeyError
+    ],
+)
+def test_notify_malformed_override_template_never_raises(override: str) -> None:
+    """Malformed ``$BGO_NOTIFY_CMD`` format strings => silent ``False``.
+
+    Regression: a stray brace made ``str.format`` raise ``ValueError``,
+    which escaped the documented "never raises" contract of ``notify``.
+    """
+    with mock.patch.dict(
+        _notify.os.environ,
+        {"BGO_NOTIFY": "all", "BGO_NOTIFY_CMD": override},
+        clear=False,
+    ), mock.patch.object(_notify.subprocess, "run") as run:
+        assert _notify.notify("t", "b", "info") is False
+    run.assert_not_called()

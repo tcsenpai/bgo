@@ -7,6 +7,7 @@ ever installed on the test host.
 
 from __future__ import annotations
 
+import plistlib
 from pathlib import Path
 from unittest import mock
 
@@ -81,14 +82,14 @@ def test_path_launchd_tray(darwin_env: Path) -> None:
 
 def test_render_systemd_unit_embeds_bgo_path() -> None:
     content = _autostart._render_systemd_unit("/usr/local/bin/bgo")
-    assert "ExecStart=/usr/local/bin/bgo resurrect" in content
+    assert 'ExecStart="/usr/local/bin/bgo" resurrect' in content
     assert "[Install]" in content
     assert "WantedBy=default.target" in content
 
 
 def test_render_xdg_desktop_embeds_bgo_path() -> None:
     content = _autostart._render_xdg_desktop("/opt/bgo")
-    assert "Exec=/opt/bgo tray" in content
+    assert 'Exec="/opt/bgo" tray' in content
     assert "Type=Application" in content
 
 
@@ -104,6 +105,50 @@ def test_render_launchd_plist_tray() -> None:
     content = _autostart._render_launchd_plist("tray", "/opt/bgo")
     assert "sh.discus.bgo.tray" in content
     assert "<string>tray</string>" in content
+
+
+def test_render_systemd_unit_quotes_path_with_spaces() -> None:
+    content = _autostart._render_systemd_unit("/opt/my tools/bgo")
+    assert 'ExecStart="/opt/my tools/bgo" resurrect' in content
+
+
+def test_render_systemd_unit_escapes_quote_and_backslash() -> None:
+    content = _autostart._render_systemd_unit('/opt/we"ird\\bgo')
+    assert 'ExecStart="/opt/we\\"ird\\\\bgo" resurrect' in content
+
+
+def test_render_systemd_unit_escapes_percent_specifier() -> None:
+    content = _autostart._render_systemd_unit("/opt/100%/bgo")
+    assert 'ExecStart="/opt/100%%/bgo" resurrect' in content
+
+
+def test_render_xdg_desktop_quotes_path_with_spaces() -> None:
+    content = _autostart._render_xdg_desktop("/opt/my tools/bgo")
+    assert 'Exec="/opt/my tools/bgo" tray' in content
+
+
+def test_render_xdg_desktop_escapes_quote_and_backslash() -> None:
+    content = _autostart._render_xdg_desktop('/opt/we"ird\\bgo')
+    assert 'Exec="/opt/we\\"ird\\\\bgo" tray' in content
+
+
+def test_render_launchd_plist_escapes_xml_special_chars() -> None:
+    content = _autostart._render_launchd_plist("resurrect", "/opt/a&b<c>/bgo")
+    assert "<string>/opt/a&amp;b&lt;c&gt;/bgo</string>" in content
+
+
+def test_render_launchd_plist_escapes_home_and_stays_parseable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A $HOME containing ``&``/``<`` must still yield a valid plist."""
+    home = tmp_path / "a&b<c"
+    monkeypatch.setattr(_autostart.Path, "home", classmethod(lambda cls: home))
+    content = _autostart._render_launchd_plist("resurrect", "/opt/bgo")
+    parsed = plistlib.loads(content.encode())
+    assert parsed["ProgramArguments"] == ["/opt/bgo", "resurrect"]
+    assert parsed["StandardOutPath"] == (
+        f"{home}/.bgo/logs/sh.discus.bgo.resurrect.out.log"
+    )
 
 
 # --- Atomic write --------------------------------------------------------
@@ -138,7 +183,7 @@ def test_install_resurrect_linux_writes_unit_and_enables(linux_env: Path) -> Non
     assert ok, msg
     unit = linux_env / "config" / "systemd" / "user" / "bgo-resurrect.service"
     assert unit.exists()
-    assert "ExecStart=/usr/local/bin/bgo resurrect" in unit.read_text()
+    assert 'ExecStart="/usr/local/bin/bgo" resurrect' in unit.read_text()
     assert calls == [
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "bgo-resurrect.service"],
@@ -161,7 +206,7 @@ def test_install_tray_linux_writes_desktop_entry_no_systemctl(linux_env: Path) -
     run.assert_not_called()
     desktop = linux_env / "config" / "autostart" / "bgo-tray.desktop"
     assert desktop.exists()
-    assert "Exec=/usr/local/bin/bgo tray" in desktop.read_text()
+    assert 'Exec="/usr/local/bin/bgo" tray' in desktop.read_text()
 
 
 def test_uninstall_resurrect_linux_removes_unit(linux_env: Path) -> None:
@@ -174,6 +219,47 @@ def test_uninstall_resurrect_linux_removes_unit(linux_env: Path) -> None:
 
     assert ok, msg
     assert not unit.exists()
+
+
+def test_uninstall_resurrect_linux_reloads_daemon_after_delete(linux_env: Path) -> None:
+    unit = linux_env / "config" / "systemd" / "user" / "bgo-resurrect.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("dummy")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        return 0, ""
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart.uninstall("resurrect")
+
+    assert ok, msg
+    assert not unit.exists()
+    assert calls == [
+        ["systemctl", "--user", "disable", "--now", "bgo-resurrect.service"],
+        ["systemctl", "--user", "daemon-reload"],
+    ]
+
+
+def test_uninstall_resurrect_linux_keeps_unit_when_disable_fails(linux_env: Path) -> None:
+    unit = linux_env / "config" / "systemd" / "user" / "bgo-resurrect.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("dummy")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        return 1, "boom"
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart.uninstall("resurrect")
+
+    assert ok is False
+    assert "disable failed" in msg
+    assert unit.exists()
+    # daemon-reload must not run when disable failed
+    assert calls == [["systemctl", "--user", "disable", "--now", "bgo-resurrect.service"]]
 
 
 def test_uninstall_tray_linux_removes_desktop_entry(linux_env: Path) -> None:
@@ -201,11 +287,15 @@ def test_install_resurrect_darwin_writes_plist_and_bootstraps(darwin_env: Path) 
     assert ok, msg
     plist = darwin_env / "Library" / "LaunchAgents" / "sh.discus.bgo.resurrect.plist"
     assert plist.exists()
-    # First call should be the bootstrap; we don't check the exact uid
-    # because os.getuid() varies in CI.
+    # First call boots out any previously loaded agent, second is the
+    # bootstrap; we don't check the exact uid because os.getuid()
+    # varies in CI.
     first = run.call_args_list[0].args[0]
-    assert first[0:2] == ["launchctl", "bootstrap"]
-    assert first[-1] == str(plist)
+    assert first[0:2] == ["launchctl", "bootout"]
+    assert first[2].endswith("/sh.discus.bgo.resurrect")
+    second = run.call_args_list[1].args[0]
+    assert second[0:2] == ["launchctl", "bootstrap"]
+    assert second[-1] == str(plist)
 
 
 def test_install_darwin_falls_back_to_legacy_load(darwin_env: Path) -> None:
@@ -227,6 +317,70 @@ def test_install_darwin_reports_both_failures(darwin_env: Path) -> None:
     assert ok is False
     assert "bootstrap failed" in msg
     assert "load failed" in msg
+
+
+def test_launchctl_load_boots_out_existing_agent_first(tmp_path: Path) -> None:
+    """Reinstall is a clean refresh: bootout precedes bootstrap."""
+    plist = tmp_path / "sh.discus.bgo.resurrect.plist"
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        return 0, ""
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, _ = _autostart._launchctl_load(plist)
+    assert ok is True
+    assert calls[0][0:2] == ["launchctl", "bootout"]
+    assert calls[0][2].endswith("/sh.discus.bgo.resurrect")
+    assert calls[1][0:2] == ["launchctl", "bootstrap"]
+    assert calls[1][-1] == str(plist)
+
+
+def test_launchctl_load_ignores_bootout_failure(tmp_path: Path) -> None:
+    """A 'not loaded' bootout failure must not fail a first install."""
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        if argv[1] == "bootout":
+            return 1, "Could not find specified service"
+        return 0, ""
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart._launchctl_load(tmp_path / "x.plist")
+    assert ok is True
+    assert msg == ""
+
+
+def test_launchctl_load_legacy_fallback_unloads_first(tmp_path: Path) -> None:
+    """On the legacy path, ``unload -w`` runs before ``load -w``."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[1] == "bootstrap":
+            return 1, "bootstrap: unknown command"
+        return 0, ""
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, _ = _autostart._launchctl_load(tmp_path / "x.plist")
+    assert ok is True
+    assert [c[1] for c in calls] == ["bootout", "bootstrap", "unload", "load"]
+
+
+def test_install_darwin_reinstall_refreshes_loaded_agent(darwin_env: Path) -> None:
+    """Re-running install while the agent is loaded succeeds via the
+    bootout/unload refresh instead of reporting failure."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[1] == "bootstrap":
+            return 1, "Bootstrap failed: Service is already loaded"
+        return 0, ""
+
+    with mock.patch.object(_autostart, "_run", side_effect=fake_run):
+        ok, msg = _autostart.install("resurrect")
+    assert ok, msg
+    assert [c[1] for c in calls] == ["bootout", "bootstrap", "unload", "load"]
 
 
 def test_uninstall_darwin_removes_plist(darwin_env: Path) -> None:

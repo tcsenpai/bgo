@@ -60,6 +60,11 @@ def strip_ansi(s: str) -> str:
 def truncate(s: str, width: int) -> str:
     """Truncate string to fit in width, accounting for ANSI codes.
 
+    Escape sequences are copied through intact: they are never counted
+    against ``width`` and never split. If the cut leaves SGR state
+    open, a reset is appended so color cannot bleed into whatever is
+    printed next.
+
     Edge cases for narrow columns:
       * ``width <= 0``  -> empty string
       * ``width <= 3``  -> ``"..."[:width]`` so output never exceeds
@@ -69,10 +74,30 @@ def truncate(s: str, width: int) -> str:
         return ""
     if width <= 3:
         return "..."[:width]
-    plain = strip_ansi(s)
-    if len(plain) > width:
-        return s[: width - 3] + "..."
-    return s
+    if len(strip_ansi(s)) <= width:
+        return s
+    budget = width - 3  # visible chars kept before the ellipsis
+    out: list[str] = []
+    visible = 0
+    sgr_open = False
+    i = 0
+    while i < len(s) and visible < budget:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            # Track SGR state param by param: "" and "0" reset,
+            # anything else opens (e.g. "\033[31;0m" ends closed).
+            for param in m.group(0)[2:-1].split(";"):
+                sgr_open = param not in ("", "0")
+            i = m.end()
+        else:
+            out.append(s[i])
+            visible += 1
+            i += 1
+    out.append("...")
+    if sgr_open:
+        out.append(COLORS["reset"])
+    return "".join(out)
 
 
 # --- Terminal capability detection --------------------------------------

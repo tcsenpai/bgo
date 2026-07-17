@@ -58,15 +58,43 @@ def _is_zombie(pid: int) -> bool:
     return False
 
 
-def is_running(pid: int | None) -> bool:
-    """Return True if pid is alive AND not a zombie/defunct process."""
+def _probe_pid_start(pid: int) -> str:
+    """Return the ``ps -o lstart=`` start-time string for pid ("" on failure).
+
+    The string is recorded in state as ``pid_start`` at spawn time and
+    re-probed before signalling, so a recycled pid can be told apart
+    from the process that was actually started.
+    """
+    try:
+        return subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def is_running(pid: int | None, expected_start: str | None = None) -> bool:
+    """Return True if pid is alive AND not a zombie/defunct process.
+
+    When ``expected_start`` is provided (the ``ps -o lstart=`` string
+    recorded at spawn time), the pid's current start time must match
+    it — a mismatch means the pid was recycled by an unrelated process
+    and we treat it as not ours. ``None`` keeps the legacy check.
+    """
     if pid is None:
         return False
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, OSError):
         return False
-    return not _is_zombie(pid)
+    if _is_zombie(pid):
+        return False
+    if expected_start is not None and _probe_pid_start(pid) != expected_start:
+        return False
+    return True
 
 
 _BLANK_PINFO: dict[str, str] = {"cpu": "-", "mem": "-", "time": "-"}
@@ -75,6 +103,19 @@ _BLANK_PINFO: dict[str, str] = {"cpu": "-", "mem": "-", "time": "-"}
 def get_process_info(pid: int) -> dict:
     """Get CPU / MEM / uptime for a single pid via ps. Prefer batch."""
     return get_process_info_batch([pid]).get(pid, dict(_BLANK_PINFO))
+
+
+def _parse_ps_info(output: str, result_map: dict[int, dict]) -> None:
+    """Parse ``ps -o pid=,%cpu=,%mem=,etime=`` output into result_map."""
+    for line in output.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 4:
+            try:
+                result_map[int(parts[0])] = {
+                    "cpu": parts[1], "mem": parts[2], "time": parts[3],
+                }
+            except ValueError:
+                continue
 
 
 def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
@@ -95,15 +136,20 @@ def get_process_info_batch(pids: list[int]) -> dict[int, dict]:
             timeout=4,
         )
         if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                parts = line.split(None, 3)
-                if len(parts) >= 4:
-                    try:
-                        result_map[int(parts[0])] = {
-                            "cpu": parts[1], "mem": parts[2], "time": parts[3],
-                        }
-                    except ValueError:
-                        continue
+            _parse_ps_info(result.stdout, result_map)
+        else:
+            # macOS/BSD ps exits non-zero when ANY requested pid is
+            # stale, which would otherwise blank every row. Fall back
+            # to per-pid probes so live pids still report real data.
+            for p in pids:
+                single = subprocess.run(
+                    ["ps", "-p", str(p), "-o", "pid=,%cpu=,%mem=,etime="],
+                    capture_output=True,
+                    text=True,
+                    timeout=4,
+                )
+                if single.returncode == 0:
+                    _parse_ps_info(single.stdout, result_map)
     except (subprocess.SubprocessError, OSError):
         pass
     # Fill misses with blanks so callers don't have to defensively .get()
@@ -162,14 +208,41 @@ def resolve_bgo_binary() -> str:
     return str(Path(sys.argv[0]).resolve())
 
 
-def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
+def kill_process(
+    pid: int,
+    pgid: int | None,
+    force: bool = False,
+    expected_start: str | None = None,
+) -> bool:
     """Kill a process (and its process group). Returns True if dead.
 
     Sends SIGTERM (or SIGKILL with ``force=True``), waits up to 5
     seconds, then escalates to SIGKILL once if the gentler signal
     didn't take. Returning False means the process survived both
     rounds (probably because we lack permission).
+
+    Hard guards refuse to signal pid <= 1, our own pid, or our own
+    process group. When ``expected_start`` is provided (the recorded
+    ``pid_start``), the pid's identity is verified before any signal
+    is sent — a mismatch means the pid was recycled by an unrelated
+    process and we refuse to touch it.
     """
+    if pid <= 1 or pid == os.getpid():
+        print(f"{color('red', '❌')} Refusing to kill PID {pid}")
+        return False
+    if pgid is not None and pgid == os.getpgid(0):
+        print(f"{color('red', '❌')} Refusing to kill own process group {pgid}")
+        return False
+    if expected_start is not None:
+        if not is_running(pid):
+            return True
+        if _probe_pid_start(pid) != expected_start:
+            print(
+                f"{color('red', '❌')} PID {pid} start time does not match the"
+                " recorded value (pid recycled?); refusing to kill"
+            )
+            return False
+
     sig = signal.SIGKILL if force else signal.SIGTERM
 
     try:
@@ -185,12 +258,12 @@ def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
 
     # Wait for termination (5 seconds in 0.1s slices).
     for _ in range(50):
-        if not is_running(pid):
+        if not is_running(pid, expected_start=expected_start):
             return True
         time.sleep(0.1)
 
     # Escalate to SIGKILL if SIGTERM didn't work.
-    if not force and is_running(pid):
+    if not force and is_running(pid, expected_start=expected_start):
         try:
             if pgid:
                 os.killpg(pgid, signal.SIGKILL)
@@ -200,12 +273,12 @@ def kill_process(pid: int, pgid: int | None, force: bool = False) -> bool:
         except (ProcessLookupError, PermissionError):
             pass
 
-    return not is_running(pid)
+    return not is_running(pid, expected_start=expected_start)
 
 
 __all__ = [
-    "_is_zombie", "is_running",
-    "get_process_info", "get_process_info_batch",
+    "_is_zombie", "_probe_pid_start", "is_running",
+    "get_process_info", "get_process_info_batch", "_parse_ps_info",
     "_looks_like_command", "derive_name", "resolve_command",
     "resolve_bgo_binary", "kill_process",
 ]

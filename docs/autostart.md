@@ -22,8 +22,9 @@ bgo autostart set <name> always  # set per-proc policy
 bgo autostart show <name>        # show per-proc policy
 ```
 
-`install` is idempotent — re-running overwrites the unit content but
-doesn't duplicate registrations.
+`install` is idempotent — re-running overwrites the unit content,
+doesn't duplicate registrations, and (on macOS) replaces the loaded
+agent so a changed plist takes effect immediately.
 
 ## Linux: lingering
 
@@ -41,7 +42,11 @@ This modifies system state, so bgo does **not** run it automatically
 ## macOS: LaunchAgent
 
 The plist is loaded via `launchctl bootstrap` (modern) with a fallback
-to `launchctl load -w` (legacy). `RunAtLoad=true` triggers on login.
+to `launchctl load -w` (legacy). Before loading, any previously loaded
+agent with the same label is torn down first (`launchctl bootout` on
+the modern path, `launchctl unload -w` on the legacy path), so
+re-installing after an upgrade moved the `bgo` binary takes effect
+without logging out. `RunAtLoad=true` triggers on login.
 
 ```bash
 # Manual inspection

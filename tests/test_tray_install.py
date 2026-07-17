@@ -1,8 +1,11 @@
 """Tests for ``bgo_cli._tray_install``.
 
-Verifies installer detection from ``sys.prefix``, command construction
-per installer kind, and the prompt + subprocess flow when one of
-``pystray`` / ``PIL`` is missing.
+Verifies installer detection from ``sys.prefix`` (including
+``UV_TOOL_DIR`` path-boundary matching), command construction per
+installer kind (the uv path must pin the running ``bgo-cli`` version
+so injecting PySide6 can never silently upgrade bgo itself), and the
+prompt + subprocess + import-verification flow when ``PySide6`` is
+missing.
 """
 
 from __future__ import annotations
@@ -48,14 +51,48 @@ def test_detect_installer_honors_uv_tool_dir_env(
     assert _tray_install.detect_installer() == "uv"
 
 
+def test_detect_installer_uv_tool_dir_matches_on_path_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``UV_TOOL_DIR`` must not match as a bare substring.
+
+    ``/opt/uv`` is a prefix of ``/opt/uvx/...`` but not a parent
+    directory of it — an unanchored substring check would misdetect.
+    """
+    monkeypatch.setenv("UV_TOOL_DIR", "/opt/uv")
+    monkeypatch.setattr(_tray_install.sys, "prefix", "/opt/uvx/tools/bgo-cli")
+    assert _tray_install.detect_installer() == "pip"
+
+
 # --- _command_for --------------------------------------------------------
 
 
-def test_command_for_uv() -> None:
+def test_command_for_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        _tray_install, "_pinned_bgo_cli_spec", lambda: "bgo-cli==9.9.9"
+    )
     argv = _tray_install._command_for("uv")
     assert argv[:3] == ["uv", "tool", "install"]
     assert "PySide6" in argv
-    assert argv[-1] == "bgo-cli"
+    assert argv[-1] == "bgo-cli==9.9.9"
+
+
+def test_command_for_uv_never_upgrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The uv argv pins the running bgo-cli version and drops
+    ``--upgrade`` — injecting PySide6 must not bump bgo itself."""
+    monkeypatch.setattr(
+        _tray_install, "_pinned_bgo_cli_spec", lambda: "bgo-cli==9.9.9"
+    )
+    argv = _tray_install._command_for("uv")
+    assert "--upgrade" not in argv
+    assert "--force" in argv
+
+
+def test_pinned_spec_uses_running_version() -> None:
+    """Default pin comes from ``bgo_cli.__version__``."""
+    from bgo_cli import __version__
+
+    assert _tray_install._pinned_bgo_cli_spec() == f"bgo-cli=={__version__}"
 
 
 def test_command_for_pipx() -> None:
@@ -142,7 +179,9 @@ def test_ensure_installed_runs_install_when_auto_true(
     with mock.patch.object(_tray_install.subprocess, "run", return_value=completed) as run:
         ok = _tray_install.ensure_installed(auto=True)
     assert ok is True
-    run.assert_called_once()
+    # Two subprocess invocations: the install command itself, then the
+    # post-install ``import PySide6`` verification.
+    assert run.call_count == 2
 
 
 def test_ensure_installed_aborts_without_auto_or_yes(
@@ -189,5 +228,61 @@ def test_ensure_installed_handles_oserror(
     monkeypatch.setattr(_tray_install, "detect_installer", lambda: "pip")
     monkeypatch.setattr(_tray_install, "_installer_available", lambda _k: True)
     with mock.patch.object(_tray_install.subprocess, "run", side_effect=OSError("x")):
+        ok = _tray_install.ensure_installed(auto=True)
+    assert ok is False
+
+
+# --- ensure_installed: post-install verification -------------------------
+
+
+def test_ensure_installed_verifies_import_after_install(
+    missing_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a successful install, we really try to import PySide6 in a
+    fresh subprocess of the target interpreter."""
+    monkeypatch.setattr(_tray_install, "detect_installer", lambda: "pip")
+    monkeypatch.setattr(_tray_install, "_installer_available", lambda _k: True)
+    monkeypatch.setattr(_tray_install.sys, "executable", "/python")
+    ok_install = mock.MagicMock(returncode=0)
+    ok_verify = mock.MagicMock(returncode=0)
+    with mock.patch.object(
+        _tray_install.subprocess, "run", side_effect=[ok_install, ok_verify]
+    ) as run:
+        ok = _tray_install.ensure_installed(auto=True)
+    assert ok is True
+    assert run.call_count == 2
+    verify_argv = run.call_args_list[1].args[0]
+    assert verify_argv == ["/python", "-c", "import PySide6"]
+
+
+def test_ensure_installed_fails_when_verification_fails(
+    missing_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean installer exit code is not enough: if PySide6 still does
+    not import in the target env, ensure_installed must return False so
+    cmd_tray does not re-exec into a loop."""
+    monkeypatch.setattr(_tray_install, "detect_installer", lambda: "pip")
+    monkeypatch.setattr(_tray_install, "_installer_available", lambda _k: True)
+    ok_install = mock.MagicMock(returncode=0)
+    bad_verify = mock.MagicMock(
+        returncode=1, stderr=b"ModuleNotFoundError: No module named 'PySide6'"
+    )
+    with mock.patch.object(
+        _tray_install.subprocess, "run", side_effect=[ok_install, bad_verify]
+    ):
+        ok = _tray_install.ensure_installed(auto=True)
+    assert ok is False
+
+
+def test_ensure_installed_fails_when_verification_crashes(
+    missing_deps: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError/timeout during verification is reported, not trusted."""
+    monkeypatch.setattr(_tray_install, "detect_installer", lambda: "pip")
+    monkeypatch.setattr(_tray_install, "_installer_available", lambda _k: True)
+    ok_install = mock.MagicMock(returncode=0)
+    with mock.patch.object(
+        _tray_install.subprocess, "run", side_effect=[ok_install, OSError("x")]
+    ):
         ok = _tray_install.ensure_installed(auto=True)
     assert ok is False

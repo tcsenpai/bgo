@@ -48,8 +48,8 @@ def test_stop_running_proc(bgo, monkeypatch):
     bgo.save_proc("web", info)
     killed: list[tuple[int, int | None, bool]] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda pid: pid == 100)
-    monkeypatch.setattr(bgo, "kill_process", lambda pid, pgid, force=False: killed.append((pid, pgid, force)) or True)
+    monkeypatch.setattr(bgo, "is_running", lambda pid, expected_start=None: pid == 100)
+    monkeypatch.setattr(bgo, "kill_process", lambda pid, pgid, force=False, expected_start=None: killed.append((pid, pgid, force)) or True)
 
     rc = bgo.cmd_stop(argparse.Namespace(name="web", force=False))
     assert rc == 0
@@ -60,7 +60,7 @@ def test_stop_running_proc(bgo, monkeypatch):
 def test_stop_already_stopped_proc(bgo, monkeypatch, capsys):
     info = _stopped_info()
     bgo.save_proc("web", info)
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
 
     rc = bgo.cmd_stop(argparse.Namespace(name="web", force=False))
     assert rc == 0
@@ -78,8 +78,8 @@ def test_stop_force_uses_sigkill(bgo, monkeypatch):
     bgo.save_proc("web", info)
     killed: list[tuple[int, int | None, bool]] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda pid: pid == 100)
-    monkeypatch.setattr(bgo, "kill_process", lambda pid, pgid, force=False: killed.append((pid, pgid, force)) or True)
+    monkeypatch.setattr(bgo, "is_running", lambda pid, expected_start=None: pid == 100)
+    monkeypatch.setattr(bgo, "kill_process", lambda pid, pgid, force=False, expected_start=None: killed.append((pid, pgid, force)) or True)
 
     bgo.cmd_stop(argparse.Namespace(name="web", force=True))
     assert killed == [(100, 100, True)]
@@ -93,8 +93,8 @@ def test_restart_stopped_proc(bgo, monkeypatch):
     bgo.save_proc("web", info)
     started: list[argparse.Namespace] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
-    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
+    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False, _expected_start=None: True)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args) or 0)
 
     rc = bgo.cmd_restart(argparse.Namespace(name="web", reset_counters=False))
@@ -109,8 +109,8 @@ def test_restart_preserves_autostart_policy(bgo, monkeypatch):
     bgo.save_proc("web", info)
     started: list[argparse.Namespace] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
-    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
+    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False, _expected_start=None: True)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args) or 0)
 
     bgo.cmd_restart(argparse.Namespace(name="web", reset_counters=False))
@@ -123,8 +123,8 @@ def test_restart_resets_counters(bgo, monkeypatch):
     bgo.save_proc("web", info)
     started: list[argparse.Namespace] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
-    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
+    monkeypatch.setattr(bgo, "kill_process", lambda _pid, _pgid, _force=False, _expected_start=None: True)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args) or 0)
 
     bgo.cmd_restart(argparse.Namespace(name="web", reset_counters=True))
@@ -141,7 +141,7 @@ def test_delete_stopped_proc(bgo, monkeypatch):
     bgo.save_proc("web", info)
     bgo.log_path("web", "out").write_text("stdout")
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
     rc = bgo.cmd_delete(argparse.Namespace(name="web", yes=True, keep_logs=False))
     assert rc == 0
     assert bgo.load_proc("web") is None
@@ -153,7 +153,7 @@ def test_delete_keep_logs(bgo, monkeypatch):
     bgo.save_proc("web", info)
     bgo.log_path("web", "out").write_text("stdout")
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
     rc = bgo.cmd_delete(argparse.Namespace(name="web", yes=True, keep_logs=True))
     assert rc == 0
     assert bgo.load_proc("web") is None
@@ -163,7 +163,7 @@ def test_delete_keep_logs(bgo, monkeypatch):
 def test_delete_running_proc_requires_confirmation(bgo, monkeypatch, capsys):
     info = _running_info()
     bgo.save_proc("web", info)
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
 
     # User declines.
     monkeypatch.setattr("builtins.input", lambda _prompt: "n")
@@ -182,7 +182,7 @@ def test_clean_removes_only_stopped_procs(bgo, monkeypatch):
     stopped["pid"] = 200
     bgo.save_proc("running", running)
     bgo.save_proc("stopped", stopped)
-    monkeypatch.setattr(bgo, "is_running", lambda pid: pid == 100)
+    monkeypatch.setattr(bgo, "is_running", lambda pid, expected_start=None: pid == 100)
 
     bgo.cmd_clean(argparse.Namespace())
     assert bgo.load_proc("running") is not None
@@ -230,7 +230,7 @@ def test_watch_attaches_watcher(bgo, monkeypatch):
         spawned.append(name)
         return 200, 200
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
     monkeypatch.setattr(bgo, "_kill_watcher", lambda _info: None)
     monkeypatch.setattr(bgo, "_spawn_watcher", fake_spawn)
 
@@ -246,7 +246,7 @@ def test_watch_attaches_watcher(bgo, monkeypatch):
 
 def test_watch_refuses_not_running_proc(bgo, monkeypatch, capsys):
     bgo.save_proc("web", _stopped_info())
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
 
     rc = bgo.cmd_watch(argparse.Namespace(
         name="web", interval=None, min_uptime=None, on_fast_crash=None, reset=False
@@ -274,7 +274,7 @@ def test_restart_stopped_all(bgo, monkeypatch):
     bgo.save_proc("b", _stopped_info("b"))
     started: list[str] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args.name) or 0)
 
     bgo.cmd_restart_stopped(argparse.Namespace(names=[], all=True))
@@ -286,7 +286,7 @@ def test_restart_stopped_named(bgo, monkeypatch):
     bgo.save_proc("b", _stopped_info("b"))
     started: list[str] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args.name) or 0)
 
     bgo.cmd_restart_stopped(argparse.Namespace(names=["a"], all=False))
@@ -302,7 +302,7 @@ def test_restart_last_all(bgo, monkeypatch):
     bgo.save_proc("b", b)
     started: list[str] = []
 
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: False)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(bgo, "cmd_start", lambda args: started.append(args.name) or 0)
 
     bgo.cmd_restart_last(argparse.Namespace(all=True))
@@ -314,7 +314,7 @@ def test_restart_last_all(bgo, monkeypatch):
 
 def test_status_detail_prints_proc_info(bgo, monkeypatch, capsys):
     bgo.save_proc("web", _running_info())
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
     monkeypatch.setattr(bgo, "get_process_info", lambda _pid: {"cpu": "1.2", "mem": "0.5", "time": "00:01"})
 
     bgo.cmd_status(argparse.Namespace(name="web", json=False, watch=False, interval=None, plain=False, fancy=False))
@@ -326,7 +326,7 @@ def test_status_detail_prints_proc_info(bgo, monkeypatch, capsys):
 def test_status_json_for_name(bgo, monkeypatch, capsys):
     info = _running_info()
     bgo.save_proc("web", info)
-    monkeypatch.setattr(bgo, "is_running", lambda _pid: True)
+    monkeypatch.setattr(bgo, "is_running", lambda _pid, expected_start=None: True)
 
     bgo.cmd_status(argparse.Namespace(name="web", json=True, watch=False, interval=None, plain=False, fancy=False))
     out = capsys.readouterr().out

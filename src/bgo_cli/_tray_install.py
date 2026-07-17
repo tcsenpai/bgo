@@ -6,9 +6,13 @@ When the user runs ``bgo tray`` without it present, this module
 detects how ``bgo`` itself was installed and proposes the matching
 install command:
 
-* ``uv tool``  -> ``uv tool install --upgrade --with PySide6 bgo-cli``
+* ``uv tool``  -> ``uv tool install --force --with PySide6 bgo-cli==<version>``
 * ``pipx``     -> ``pipx inject bgo-cli PySide6``
 * anything else -> ``pip install --user PySide6``
+
+The uv command pins ``bgo-cli`` to the currently-running version and
+uses ``--force`` (reinstall) instead of ``--upgrade``, so injecting
+PySide6 can never silently bump (or re-resolve) the installed bgo.
 
 Detection is heuristic but reliable in practice: each installer
 leaves its name in ``sys.prefix`` (e.g. ``~/.local/share/uv/tools/bgo-cli``).
@@ -57,7 +61,12 @@ def detect_installer() -> InstallerKind:
     uv_tool_dir = (os.environ.get("UV_TOOL_DIR") or "").strip()
     if uv_tool_dir:
         normalized = uv_tool_dir.replace("\\", "/").rstrip("/").lower()
-        if normalized and normalized in lower:
+        # Compare on a path-component boundary: an unanchored substring
+        # match would false-positive when the tool dir is a prefix of an
+        # unrelated path (e.g. UV_TOOL_DIR=/opt/uv vs /opt/uvx/...).
+        if normalized and (
+            lower == normalized or lower.startswith(normalized + "/")
+        ):
             return "uv"
     if "/uv/tools/" in lower or "uv-tool" in lower:
         return "uv"
@@ -66,15 +75,35 @@ def detect_installer() -> InstallerKind:
     return "pip"
 
 
+def _pinned_bgo_cli_spec() -> str:
+    """Pin ``bgo-cli`` to the currently-running version.
+
+    Without a pin, ``uv tool install`` re-resolves bgo-cli from PyPI and
+    would silently swap the running install for whatever version (or
+    provenance) the index serves. Function-level import matches the
+    lazy-import style used elsewhere in this package.
+    """
+    from bgo_cli import __version__
+
+    return f"bgo-cli=={__version__}"
+
+
 def _command_for(installer: InstallerKind) -> list[str]:
     """Return the argv that injects ``PySide6``."""
     if installer == "uv":
+        # ``--force`` reinstalls the tool (required when it's already
+        # installed) while the pinned spec keeps the exact same bgo-cli
+        # version — unlike ``--upgrade``, which would bump it. If the
+        # running version isn't on PyPI (dev build), the command fails
+        # and ensure_installed prints manual instructions.
         return [
-            "uv", "tool", "install", "--upgrade",
+            "uv", "tool", "install", "--force",
             "--with", "PySide6",
-            "bgo-cli",
+            _pinned_bgo_cli_spec(),
         ]
     if installer == "pipx":
+        # ``inject`` adds packages to the existing venv; it never
+        # touches the bgo-cli package itself.
         return ["pipx", "inject", "bgo-cli", "PySide6"]
     return [
         sys.executable, "-m", "pip", "install", "--user",
@@ -103,6 +132,42 @@ def _installer_available(installer: InstallerKind) -> bool:
     if installer == "pipx":
         return shutil.which("pipx") is not None
     # ``pip`` runs as ``python -m pip``; always available if Python is.
+    return True
+
+
+def _verify_pyside6_importable() -> bool:
+    """Best-effort check that the install actually delivered PySide6.
+
+    ``detect_installer`` keys off ``sys.prefix``, so ``sys.executable``
+    is the interpreter of the environment the install command just
+    modified (the uv tool venv, the pipx venv, or the current
+    user-site python). A *fresh* subprocess re-reads site-packages at
+    startup, so a clean import here means the caller's re-exec will
+    see PySide6 too — an honest check, unlike trusting rc==0 from the
+    installer.
+    """
+    argv = [sys.executable, "-c", "import PySide6"]
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"{_ansi('yellow', '⚠')}  could not verify PySide6 import: {exc}")
+        return False
+    if result.returncode != 0:
+        print(
+            f"{_ansi('red', '❌')} install finished but PySide6 still "
+            f"does not import in the target environment."
+        )
+        detail = (result.stderr or b"").decode(errors="replace").strip()
+        if detail:
+            print(f"   {detail.splitlines()[-1]}")
+        return False
     return True
 
 
@@ -166,13 +231,27 @@ def ensure_installed(auto: bool = False) -> bool:
             f"{_ansi('red', '❌')} install exited with code "
             f"{result.returncode}."
         )
+        if installer == "uv":
+            print(
+                f"   The pinned spec {_ansi('bold', argv[-1])} could not "
+                f"be resolved — you may be running a dev or pre-release\n"
+                f"   version that is not on PyPI. Add PySide6 manually "
+                f"against your original install source, e.g.:\n"
+                f"     uv tool install --force --with PySide6 <source-you-installed-bgo-from>"
+            )
         return False
 
-    # Verify the install actually delivered the deps. If the user is
-    # running in a different env than the one we just modified (uv tool
-    # case in particular), they need to re-exec via the installed
-    # entrypoint — bgo handles that in cmd_tray's re-exec path.
-    print(f"{_ansi('green', '✅')} install complete.")
+    # Verify the install actually delivered the deps before telling the
+    # caller it's safe to re-exec — a false positive here would loop
+    # cmd_tray's re-exec path forever.
+    if not _verify_pyside6_importable():
+        print(
+            f"   Re-run `bgo tray` to retry, or install PySide6 manually "
+            f"with the command above."
+        )
+        return False
+
+    print(f"{_ansi('green', '✅')} install complete and verified.")
     return True
 
 

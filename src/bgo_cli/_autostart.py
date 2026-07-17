@@ -13,8 +13,9 @@ Backends are detected automatically:
   a hint rather than running it ourselves (it touches system state).
 
 * **macOS** -> launchd user agent. The plist is written to
-  ``~/Library/LaunchAgents/`` and loaded via ``launchctl bootstrap``.
-  ``RunAtLoad=true`` triggers on login.
+  ``~/Library/LaunchAgents/`` and loaded via ``launchctl bootstrap``;
+  any previously loaded agent is booted out first so re-installing
+  takes effect immediately. ``RunAtLoad=true`` triggers on login.
 
 The tray target writes a separate desktop-autostart entry:
 
@@ -33,6 +34,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Literal
+from xml.sax.saxutils import escape as xml_escape
 
 Target = Literal["resurrect", "tray"]
 Backend = Literal["systemd-user", "launchd"]
@@ -146,14 +148,35 @@ def _path_for(backend: Backend, target: Target) -> Path:
 # --- Content rendering ---------------------------------------------------
 
 
+def _systemd_quote(path: str) -> str:
+    """Quote a path for a systemd ``ExecStart=`` line.
+
+    Double quotes protect spaces; ``\\`` and ``"`` are backslash-escaped
+    and ``%`` is doubled because systemd expands it as a specifier even
+    inside quotes.
+    """
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
+def _xdg_quote(path: str) -> str:
+    """Quote a path for an XDG desktop-entry ``Exec=`` line.
+
+    Double quotes protect spaces; per the desktop-entry spec ``\\`` and
+    ``"`` inside a quoted argument are backslash-escaped.
+    """
+    escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _render_systemd_unit(bgo: str) -> str:
     """Render the resurrect systemd unit."""
-    return _SYSTEMD_UNIT.format(bgo=bgo)
+    return _SYSTEMD_UNIT.format(bgo=_systemd_quote(bgo))
 
 
 def _render_xdg_desktop(bgo: str) -> str:
     """Render the tray XDG autostart entry."""
-    return _XDG_DESKTOP.format(bgo=bgo)
+    return _XDG_DESKTOP.format(bgo=_xdg_quote(bgo))
 
 
 def _render_launchd_plist(target: Target, bgo: str) -> str:
@@ -164,8 +187,14 @@ def _render_launchd_plist(target: Target, bgo: str) -> str:
     else:
         label = _LAUNCHD_LABEL_TRAY
         extra = "    <string>tray</string>"
+    # extra_args is XML markup and must stay raw; every other
+    # interpolated value is escaped so paths containing ``&``/``<``
+    # don't produce malformed XML.
     return _LAUNCHD_PLIST.format(
-        label=label, bgo=bgo, extra_args=extra, home=str(Path.home())
+        label=xml_escape(label),
+        bgo=xml_escape(bgo),
+        extra_args=extra,
+        home=xml_escape(str(Path.home())),
     )
 
 
@@ -215,14 +244,23 @@ def _systemd_disable(unit: str) -> tuple[bool, str]:
 
 
 def _launchctl_load(plist: Path) -> tuple[bool, str]:
-    """Bootstrap a per-user agent. Falls back to legacy ``load`` cmd."""
+    """Bootstrap a per-user agent. Falls back to legacy ``load`` cmd.
+
+    Any previously loaded agent with the same label is torn down first
+    (errors ignored — usually "not loaded" on first install), so
+    re-running install is a clean refresh: a rewritten plist (e.g. the
+    bgo binary moved in an upgrade) takes effect immediately instead of
+    only after the next logout.
+    """
     uid = os.getuid()
+    label = plist.stem  # _path_for names the file after the label
+    _run(["launchctl", "bootout", f"gui/{uid}/{label}"])
     rc, out = _run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)])
     if rc == 0:
         return True, ""
-    # Older macOS / already-loaded states return non-zero — try legacy
-    # ``load`` as a fallback so we don't error on cleanly reusable
-    # plists.
+    # Older macOS lacks ``bootstrap`` — fall back to the legacy
+    # ``unload`` + ``load`` pair so we don't error on older systems.
+    _run(["launchctl", "unload", "-w", str(plist)])
     rc2, out2 = _run(["launchctl", "load", "-w", str(plist)])
     if rc2 == 0:
         return True, ""
@@ -304,10 +342,17 @@ def uninstall(target: Target) -> tuple[bool, str]:
 
     if backend == "systemd-user":
         if target == "resurrect":
+            # Symmetric with the launchd path: only delete the unit once
+            # disable succeeds, so a failed disable doesn't orphan a
+            # still-registered unit. daemon-reload makes the manager
+            # forget the deleted unit.
             ok, err = _systemd_disable("bgo-resurrect.service")
-            path.unlink(missing_ok=True)
             if not ok:
                 return False, err
+            path.unlink(missing_ok=True)
+            rc, out = _run(["systemctl", "--user", "daemon-reload"])
+            if rc != 0:
+                return False, f"daemon-reload failed: {out.strip()}"
             return True, ""
         path.unlink(missing_ok=True)
         return True, ""

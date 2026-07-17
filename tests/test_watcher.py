@@ -240,7 +240,7 @@ def test_watcher_loop_exits_when_state_vanishes(monkeypatch: pytest.MonkeyPatch)
         return info if len(calls) < 2 else None
 
     monkeypatch.setattr(_watcher, "load_proc", load)
-    monkeypatch.setattr(_watcher, "is_running", lambda _pid: True)
+    monkeypatch.setattr(_watcher, "is_running", lambda _pid, expected_start=None: True)
     monkeypatch.setattr(_watcher.time, "sleep", lambda _s: None)
     monkeypatch.setattr(_watcher, "signal", mock.MagicMock())
     assert _watcher.cmd_watcher_loop("web") == 0
@@ -259,7 +259,7 @@ def test_watcher_loop_fast_crash_stop_mode_marks_errored(
 
     monkeypatch.setattr(_watcher, "load_proc", lambda _name: dict(info))
     monkeypatch.setattr(_watcher, "save_proc", save)
-    monkeypatch.setattr(_watcher, "is_running", lambda _pid: False)
+    monkeypatch.setattr(_watcher, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(_watcher, "_tail_stderr", lambda _name: "stderr tail")
     monkeypatch.setattr(_watcher, "_notify_errored", lambda _n, _r: None)
     monkeypatch.setattr(_watcher.time, "sleep", lambda _s: None)
@@ -271,6 +271,7 @@ def test_watcher_loop_fast_crash_stop_mode_marks_errored(
     assert "fast-crash" in saved["watch"]["error_reason"]
     assert saved["watch"]["last_stderr_tail"] == "stderr tail"
     assert saved["status"] == "stopped"
+    assert saved["stop_reason"] == "crashed"
 
 
 def test_watcher_loop_backoff_exits_after_repeated_fast_crashes(
@@ -291,9 +292,10 @@ def test_watcher_loop_backoff_exits_after_repeated_fast_crashes(
 
     monkeypatch.setattr(_watcher, "load_proc", lambda _name: dict(info))
     monkeypatch.setattr(_watcher, "save_proc", save)
-    monkeypatch.setattr(_watcher, "is_running", lambda _pid: False)
+    monkeypatch.setattr(_watcher, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(_watcher, "_tail_stderr", lambda _name: "boom")
     monkeypatch.setattr(_watcher, "_restart_proc_inplace", restart)
+    monkeypatch.setattr(_watcher, "_probe_pid_start", lambda _pid: "")
     monkeypatch.setattr(_watcher, "_notify_errored", lambda _n, _r: None)
     monkeypatch.setattr(_watcher.time, "sleep", lambda _s: None)
     monkeypatch.setattr(_watcher, "signal", mock.MagicMock())
@@ -304,6 +306,8 @@ def test_watcher_loop_backoff_exits_after_repeated_fast_crashes(
     final = saved_states[-1]
     assert final["watch"]["errored"] is True
     assert "consecutive fast-crashes" in final["watch"]["error_reason"]
+    assert final["status"] == "stopped"
+    assert final["stop_reason"] == "crashed"
 
 
 def test_watcher_loop_retry_mode_keeps_restarting_until_restart_fails(
@@ -326,9 +330,10 @@ def test_watcher_loop_retry_mode_keeps_restarting_until_restart_fails(
 
     monkeypatch.setattr(_watcher, "load_proc", lambda _name: dict(info))
     monkeypatch.setattr(_watcher, "save_proc", save)
-    monkeypatch.setattr(_watcher, "is_running", lambda _pid: False)
+    monkeypatch.setattr(_watcher, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(_watcher, "_tail_stderr", lambda _name: "")
     monkeypatch.setattr(_watcher, "_restart_proc_inplace", restart)
+    monkeypatch.setattr(_watcher, "_probe_pid_start", lambda _pid: "")
     monkeypatch.setattr(_watcher, "_notify_errored", lambda _n, _r: None)
     monkeypatch.setattr(_watcher.time, "sleep", lambda _s: None)
     monkeypatch.setattr(_watcher, "signal", mock.MagicMock())
@@ -338,6 +343,7 @@ def test_watcher_loop_retry_mode_keeps_restarting_until_restart_fails(
     final = saved_states[-1]
     assert final["watch"]["errored"] is True
     assert final["watch"]["error_reason"] == "gave up"
+    assert final["stop_reason"] == "crashed"
 
 
 def test_watcher_loop_restart_failure_marks_errored(
@@ -353,7 +359,7 @@ def test_watcher_loop_restart_failure_marks_errored(
 
     monkeypatch.setattr(_watcher, "load_proc", lambda _name: dict(info))
     monkeypatch.setattr(_watcher, "save_proc", save)
-    monkeypatch.setattr(_watcher, "is_running", lambda _pid: False)
+    monkeypatch.setattr(_watcher, "is_running", lambda _pid, expected_start=None: False)
     monkeypatch.setattr(_watcher, "_tail_stderr", lambda _name: "boom")
     monkeypatch.setattr(
         _watcher, "_restart_proc_inplace", lambda _info: (None, None, "failed to start")
@@ -365,6 +371,8 @@ def test_watcher_loop_restart_failure_marks_errored(
     assert _watcher.cmd_watcher_loop("web") == 0
     assert saved["watch"]["errored"] is True
     assert saved["watch"]["error_reason"] == "failed to start"
+    assert saved["status"] == "stopped"
+    assert saved["stop_reason"] == "crashed"
 
 
 def test_watcher_loop_sets_sigchld_to_ignore(monkeypatch: pytest.MonkeyPatch) -> None:

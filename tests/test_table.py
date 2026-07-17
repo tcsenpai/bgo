@@ -144,3 +144,40 @@ def test_status_json_does_not_mutate_state(bgo, monkeypatch, capsys):
     bgo.cmd_status(argparse.Namespace(json=True, name=None, watch=False, interval=None, plain=True, fancy=False))
     info = bgo.load_proc("dead")
     assert info["status"] == "running"
+
+
+# --- ANSI-aware truncation ------------------------------------------------
+
+
+def test_truncate_plain_text_unchanged(bgo):
+    """Plain-text behavior is identical to before the ANSI fix."""
+    assert bgo.truncate("hello world", 8) == "hello..."
+    assert bgo.truncate("short", 10) == "short"
+    assert bgo.truncate("anything", 3) == "..."
+    assert bgo.truncate("anything", 0) == ""
+
+
+def test_truncate_never_splits_escape_sequence(bgo):
+    """A raw ``s[:width-3]`` slice would land mid-sequence; the ANSI-aware
+    walk must copy the sequence whole and terminate with a reset."""
+    s = "abc\033[31mdefghij\033[0m"
+    out = bgo.truncate(s, 8)
+    assert out == "abc\033[31mde...\033[0m"
+    assert bgo.strip_ansi(out) == "abcde..."
+
+
+def test_truncate_appends_reset_when_sgr_left_open(bgo):
+    """Colored input cut mid-string stays within width and ends reset."""
+    colored = "\033[31mhello world\033[0m"
+    out = bgo.truncate(colored, 8)
+    assert bgo.strip_ansi(out) == "hello..."
+    assert len(bgo.strip_ansi(out)) <= 8
+    assert out.endswith("\033[0m")
+
+
+def test_truncate_no_duplicate_reset_when_sgr_closed(bgo):
+    """If the copied prefix already closed SGR, no extra reset is added."""
+    s = "\033[31mab\033[0mcdefghi"
+    out = bgo.truncate(s, 6)
+    assert bgo.strip_ansi(out) == "abc..."
+    assert out.count("\033[0m") == 1

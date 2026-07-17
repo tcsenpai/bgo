@@ -121,8 +121,11 @@ rm -rf /tmp/bgo-verify
   pulled in via hatchling's `force-include`. Exactly one copy of the
   implementation in source control; the package layer is a thin
   re-exporter.
-- The root `bgo` script remains the canonical single-file artifact for
-  users who prefer `cp bgo /usr/local/bin/` or `install.sh`.
+- The root `bgo` script is the canonical source of the implementation,
+  but it is not standalone-runnable: it imports the `bgo_cli` package.
+  Users install the package instead — from PyPI, or via `install.sh`
+  (which wraps `uv tool` / `pipx` / `pip --user`). `cp bgo
+  /usr/local/bin/` produces a broken binary and must not be advertised.
 - `__version__` lives in `src/bgo_cli/__init__.py` and must match the
   `[project] version` field in `pyproject.toml`. `publish.sh` refuses
   to run if they drift.
